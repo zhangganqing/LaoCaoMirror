@@ -1,0 +1,214 @@
+# -*- coding: utf-8 -*-
+"""人工确认学习：待审照片、去重、热更新与自动样本上限。"""
+import os
+import inspect
+import tempfile
+import threading
+import unittest
+from datetime import datetime
+from unittest.mock import patch
+
+import cv2
+import numpy as np
+
+import main as core
+
+
+def _write_image(path, value):
+    image = np.full((24, 24, 3), value, dtype=np.uint8)
+    assert cv2.imwrite(path, image)
+
+
+def _recognizer_without_models(gallery_dir, embeddings, candidate_embedding):
+    recognizer = core.FaceRecognizer.__new__(core.FaceRecognizer)
+    recognizer.gallery_dir = gallery_dir
+    recognizer.gallery = {}
+    recognizer.gallery_embeddings = {
+        os.path.basename(gallery_dir): {
+            filename: np.asarray(vector, dtype=np.float32)
+            for filename, vector in embeddings.items()
+        }
+    }
+    recognizer._embed = lambda _image: np.asarray(candidate_embedding, dtype=np.float32)
+    recognizer._refresh_gallery_mean(os.path.basename(gallery_dir))
+    return recognizer
+
+
+class FaceReviewSessionTests(unittest.TestCase):
+    def test_keeps_the_highest_score_crop_and_reject_deletes_it(self):
+        self.assertTrue(hasattr(core, "FaceReviewSession"), "待确认记录功能尚未实现")
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            review = core.FaceReviewSession(gallery_dir)
+            low = np.full((20, 20, 3), 30, dtype=np.uint8)
+            high = np.full((20, 20, 3), 220, dtype=np.uint8)
+
+            self.assertTrue(review.start(low, 0.55, now=datetime(2026, 8, 30, 19, 0, 0)))
+            pending_path = review.pending_path
+            self.assertFalse(review.consider(high, 0.50))
+            self.assertTrue(review.consider(high, 0.80))
+            saved = cv2.imread(pending_path)
+
+            self.assertGreater(float(saved.mean()), 200)
+            self.assertTrue(review.reject())
+            self.assertFalse(os.path.exists(pending_path))
+
+
+class FaceGalleryLearningTests(unittest.TestCase):
+    def test_confirm_promotes_photo_and_updates_gallery_without_restart(self):
+        self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "图库热学习尚未实现")
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            _write_image(os.path.join(gallery_dir, "manual.jpg"), 80)
+            recognizer = _recognizer_without_models(
+                gallery_dir, {"manual.jpg": [1.0, 0.0]}, [0.8, 0.6])
+            candidate = np.full((32, 32, 3), 160, dtype=np.uint8)
+
+            result = recognizer.learn_face(
+                candidate, duplicate_threshold=0.99,
+                now=datetime(2026, 8, 30, 19, 1, 2, 345000))
+
+            self.assertEqual(result["status"], "learned")
+            self.assertTrue(os.path.basename(result["path"]).startswith("learned_20260830_190102_345"))
+            self.assertTrue(os.path.exists(result["path"]))
+            name = os.path.basename(gallery_dir)
+            self.assertIn(os.path.basename(result["path"]), recognizer.gallery_embeddings[name])
+            expected = np.array([0.9, 0.3], dtype=np.float32)
+            expected /= np.linalg.norm(expected)
+            np.testing.assert_allclose(recognizer.gallery[name], expected, atol=1e-6)
+
+    def test_duplicate_confirmation_does_not_add_another_photo(self):
+        self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "图库去重尚未实现")
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            _write_image(os.path.join(gallery_dir, "manual.jpg"), 80)
+            recognizer = _recognizer_without_models(
+                gallery_dir, {"manual.jpg": [1.0, 0.0]}, [0.999, 0.01])
+
+            result = recognizer.learn_face(
+                np.full((32, 32, 3), 160, dtype=np.uint8),
+                duplicate_threshold=0.95)
+
+            self.assertEqual(result["status"], "duplicate")
+            self.assertEqual(
+                [name for name in os.listdir(gallery_dir) if name.startswith("learned_")], [])
+
+    def test_cap_removes_only_oldest_auto_learned_photo(self):
+        self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "自动样本上限尚未实现")
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            paths = {
+                "manual.jpg": os.path.join(gallery_dir, "manual.jpg"),
+                "learned_old.jpg": os.path.join(gallery_dir, "learned_old.jpg"),
+                "learned_newer.jpg": os.path.join(gallery_dir, "learned_newer.jpg"),
+            }
+            for i, path in enumerate(paths.values()):
+                _write_image(path, 40 + i * 20)
+            os.utime(paths["learned_old.jpg"], (10, 10))
+            os.utime(paths["learned_newer.jpg"], (20, 20))
+            recognizer = _recognizer_without_models(
+                gallery_dir,
+                {"manual.jpg": [1.0, 0.0], "learned_old.jpg": [0.9, 0.1],
+                 "learned_newer.jpg": [0.8, 0.2]},
+                [0.0, 1.0])
+
+            result = recognizer.learn_face(
+                np.full((32, 32, 3), 200, dtype=np.uint8),
+                max_learned=2, duplicate_threshold=0.999,
+                now=datetime(2026, 8, 30, 19, 2, 3))
+
+            self.assertEqual(result["status"], "learned")
+            self.assertTrue(os.path.exists(paths["manual.jpg"]))
+            self.assertFalse(os.path.exists(paths["learned_old.jpg"]))
+            learned = [name for name in os.listdir(gallery_dir) if name.startswith("learned_")]
+            self.assertEqual(len(learned), 2)
+
+
+class _LoopCapture:
+    def __init__(self, decision_event):
+        self.decision_event = decision_event
+        self.state = None
+        self.seen_defend = False
+        self.events = []
+
+    def on_event(self, text):
+        self.events.append(text)
+
+    def on_state(self, state):
+        self.state = state
+        if state == "DEFEND" and not self.seen_defend:
+            self.seen_defend = True
+            self.decision_event.set()
+
+    def on_frame(self, _frame):
+        return not (self.seen_defend and self.state == "PATROL")
+
+
+class _LoopCaptureSource:
+    def __init__(self):
+        self.frame = np.full((100, 100, 3), 120, dtype=np.uint8)
+
+    def read(self):
+        return True, self.frame.copy()
+
+    def release(self):
+        pass
+
+
+class _LoopDetector:
+    def detect(self, _frame, imgsz=960):
+        return np.array([[25, 20, 75, 80]])
+
+
+class _LoopRecognizer:
+    def __init__(self, learning_status="learned"):
+        self.learn_calls = 0
+        self.learning_status = learning_status
+
+    def identify(self, _face):
+        return "laocao", 0.80
+
+    def learn_face(self, _face, **_kwargs):
+        self.learn_calls += 1
+        return {"status": self.learning_status, "path": "learned_test.jpg"}
+
+
+class ReviewDecisionPipelineTests(unittest.TestCase):
+    def _cfg(self, gallery_dir):
+        cfg = dict(core.DEFAULTS)
+        cfg.update({"gallery_dir": gallery_dir, "fps": 1000, "confirm_frames": 1,
+                    "roi": None, "mirror": False, "guard_window_keyword": ""})
+        return cfg
+
+    def _run_decision(self, decision):
+        params = inspect.signature(core.run_loop).parameters
+        self.assertIn("confirm_learn_event", params, "确认学习事件尚未接入状态机")
+        self.assertIn("reject_event", params, "误报删除事件尚未接入状态机")
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            confirm_event = threading.Event()
+            reject_event = threading.Event()
+            selected = confirm_event if decision == "confirm" else reject_event
+            cb = _LoopCapture(selected)
+            recognizer = _LoopRecognizer()
+            with patch.object(core, "beep"), patch.object(core, "restore_screen"):
+                core.run_loop(
+                    self._cfg(gallery_dir), _LoopCaptureSource(), _LoopDetector(),
+                    recognizer, None, cb, confirm_learn_event=confirm_event,
+                    reject_event=reject_event)
+            pending_dir = os.path.join(gallery_dir, ".pending")
+            pending = os.listdir(pending_dir) if os.path.isdir(pending_dir) else []
+            return recognizer, cb.events, pending
+
+    def test_confirm_learns_then_restores_and_clears_pending_photo(self):
+        recognizer, events, pending = self._run_decision("confirm")
+        self.assertEqual(recognizer.learn_calls, 1)
+        self.assertTrue(any("[学习]" in text for text in events))
+        self.assertTrue(any("[恢复]" in text for text in events))
+        self.assertEqual(pending, [])
+
+    def test_false_positive_deletes_without_learning_then_restores(self):
+        recognizer, events, pending = self._run_decision("reject")
+        self.assertEqual(recognizer.learn_calls, 0)
+        self.assertTrue(any("[误报]" in text for text in events))
+        self.assertTrue(any("[恢复]" in text for text in events))
+        self.assertEqual(pending, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

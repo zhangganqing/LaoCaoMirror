@@ -14,5 +14,7 @@
   "beep_alert": true,
   "guard_window_keyword": "",
   "gallery_dir": "laocao",
+  "max_learned_photos": 30,
+  "learned_duplicate_threshold": 0.93,
   "models_dir": "models"
 }

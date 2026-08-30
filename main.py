@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 # PyInstaller 打包(--windowed)后 stdout 为 None, print 会崩; 资源锚定到 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -56,6 +57,8 @@ DEFAULTS = {
     "beep_alert": True,       # 陌生人(认不出)提醒音
     "guard_window_keyword": "GuardWindow",  # 护身窗口标题关键字
     "gallery_dir": "laocao",  # 老曹照片文件夹(目录名=身份名)
+    "max_learned_photos": 30,   # 自动确认学习的照片上限(手工照片不计入且永不自动删除)
+    "learned_duplicate_threshold": 0.93,  # 与已有照片过于相似时不重复入库
     "models_dir": "models",
 }
 
@@ -86,7 +89,7 @@ def save_config(cfg, path="config.json"):
 # ArcFace 标准五点(112x112), 本模型无关键点输出, 用等比缩放对齐
 ARC_DST = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
                     [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
-FACE_CACHE_VERSION = 2
+FACE_CACHE_VERSION = 3
 
 
 class FaceDetector:
@@ -166,7 +169,9 @@ class FaceRecognizer:
         self.input_name = self.sess.get_inputs()[0].name
         self.detector = detector   # 注册半身照时需先检测裁脸
         self.aligner = aligner
+        self.gallery_dir = gallery_dir
         self.gallery = {}  # name -> 归一化平均特征
+        self.gallery_embeddings = {}  # name -> {照片文件名: 归一化特征}
         self._load_gallery(gallery_dir)
 
     def _largest_face(self, img):
@@ -197,10 +202,14 @@ class FaceRecognizer:
                     cache = json.load(f)
                 if (cache.get("version") == FACE_CACHE_VERSION
                         and cache.get("name") == name
-                        and cache.get("fingerprint") == fingerprint):
-                    vec = np.array(cache["mean"], dtype=np.float32)
-                    vec /= np.linalg.norm(vec)
-                    self.gallery[name] = vec
+                        and cache.get("fingerprint") == fingerprint
+                        and isinstance(cache.get("embeddings"), dict)):
+                    vectors = {
+                        fn: np.array(values, dtype=np.float32)
+                        for fn, values in cache["embeddings"].items()
+                    }
+                    self.gallery_embeddings[name] = vectors
+                    self._refresh_gallery_mean(name)
                     print(f"[人脸库] {name}: {len(photos)} 张照片 (读取缓存, 无需重算)")
                     return
             except Exception:
@@ -220,18 +229,106 @@ class FaceRecognizer:
                 continue
             registered.append((fn, embedding))
         if registered:
-            mean = np.mean([v for _, v in registered], axis=0)
-            mean /= np.linalg.norm(mean)
-            self.gallery[name] = mean
+            self.gallery_embeddings[name] = dict(registered)
+            self._refresh_gallery_mean(name)
+            mean = self.gallery[name]
             worst = min(registered, key=lambda r: float(mean @ r[1]))
             print(f"[人脸库] {name}: {len(registered)} 张照片入库, "
                   f"最差一致度 {float(mean @ worst[1]):.2f} ({worst[0]})")
             try:
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump({"version": FACE_CACHE_VERSION, "name": name, "fingerprint": fingerprint,
-                               "mean": mean.tolist()}, f, ensure_ascii=False)
+                self._write_gallery_cache(name)
             except Exception:
                 pass
+
+    def _refresh_gallery_mean(self, name):
+        """用当前逐照片特征重算身份中心；确认学习后无需重启即可生效。"""
+        vectors = list(self.gallery_embeddings.get(name, {}).values())
+        if not vectors:
+            self.gallery.pop(name, None)
+            return
+        mean = np.mean(vectors, axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(mean))
+        if norm > 0:
+            self.gallery[name] = mean / norm
+
+    def _write_gallery_cache(self, name):
+        photos = [fn for fn in os.listdir(self.gallery_dir)
+                  if fn.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))]
+        fingerprint = {
+            fn: [os.path.getsize(os.path.join(self.gallery_dir, fn)),
+                 int(os.path.getmtime(os.path.join(self.gallery_dir, fn)))]
+            for fn in photos
+        }
+        embeddings = {
+            fn: vector.tolist()
+            for fn, vector in self.gallery_embeddings.get(name, {}).items()
+            if fn in fingerprint
+        }
+        cache_path = os.path.join(self.gallery_dir, "face_cache.json")
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({"version": FACE_CACHE_VERSION, "name": name,
+                       "fingerprint": fingerprint, "embeddings": embeddings,
+                       "mean": self.gallery.get(name, np.array([])).tolist()},
+                      f, ensure_ascii=False)
+
+    def learn_face(self, face_img, max_learned=30, duplicate_threshold=0.93, now=None):
+        """人工确认后把脸照加入图库，并立即更新内存特征。
+
+        learned_ 前缀专门标记自动样本；达到上限时只删除其中最旧的，
+        用户手工放入图库的照片永远不会被这里清理。
+        """
+        if face_img is None or face_img.size == 0:
+            return {"status": "invalid", "message": "待学习照片为空"}
+        embedding = self._embed(face_img)
+        if embedding is None:
+            return {"status": "invalid", "message": "照片中的五点关键点对齐失败"}
+        embedding = np.asarray(embedding, dtype=np.float32)
+        norm = float(np.linalg.norm(embedding))
+        if norm <= 0:
+            return {"status": "invalid", "message": "无法生成有效人脸特征"}
+        embedding /= norm
+
+        os.makedirs(self.gallery_dir, exist_ok=True)
+        name = os.path.basename(os.path.normpath(self.gallery_dir))
+        samples = self.gallery_embeddings.setdefault(name, {})
+        similarities = [(fn, float(vector @ embedding)) for fn, vector in samples.items()]
+        if similarities:
+            closest_file, closest_score = max(similarities, key=lambda item: item[1])
+            if closest_score >= duplicate_threshold:
+                return {"status": "duplicate", "similarity": closest_score,
+                        "duplicate_of": closest_file}
+
+        stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"learned_{stamp}.jpg"
+        path = os.path.join(self.gallery_dir, filename)
+        suffix = 1
+        while os.path.exists(path):
+            filename = f"learned_{stamp}_{suffix}.jpg"
+            path = os.path.join(self.gallery_dir, filename)
+            suffix += 1
+        if not cv2.imwrite(path, face_img):
+            return {"status": "error", "message": "学习照片写入磁盘失败"}
+
+        samples[filename] = embedding
+        learned = [fn for fn in samples if fn.startswith("learned_")]
+        learned.sort(key=lambda fn: (os.path.getmtime(os.path.join(self.gallery_dir, fn)), fn))
+        removed = []
+        while len(learned) > max(0, int(max_learned)):
+            oldest = learned.pop(0)
+            oldest_path = os.path.join(self.gallery_dir, oldest)
+            try:
+                os.remove(oldest_path)
+                removed.append(oldest)
+                samples.pop(oldest, None)
+            except OSError:
+                break
+        self._refresh_gallery_mean(name)
+        try:
+            self._write_gallery_cache(name)
+        except Exception:
+            pass
+        return {"status": "learned", "path": path, "removed": removed,
+                "sample_count": len(samples)}
 
     def _embed(self, face_img, align_size=320):
         if self.aligner is not None:
@@ -254,6 +351,64 @@ class FaceRecognizer:
             return None, -1.0
         name = max(self.gallery, key=lambda k: float(self.gallery[k] @ e))
         return name, float(self.gallery[name] @ e)
+
+
+class FaceReviewSession:
+    """一次防御事件对应的一张待人工确认照片，始终保留分数最高的脸。"""
+
+    def __init__(self, gallery_dir):
+        self.pending_dir = os.path.join(gallery_dir, ".pending")
+        self.pending_path = None
+        self.best_score = -1.0
+
+    def start(self, face_img, score, now=None):
+        if face_img is None or face_img.size == 0:
+            return False
+        os.makedirs(self.pending_dir, exist_ok=True)
+        stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        self.pending_path = os.path.join(self.pending_dir, f"pending_{stamp}.jpg")
+        suffix = 1
+        while os.path.exists(self.pending_path):
+            self.pending_path = os.path.join(
+                self.pending_dir, f"pending_{stamp}_{suffix}.jpg")
+            suffix += 1
+        self.best_score = float(score)
+        if not cv2.imwrite(self.pending_path, face_img):
+            self.pending_path = None
+            self.best_score = -1.0
+            return False
+        return True
+
+    def consider(self, face_img, score):
+        if self.pending_path is None or score <= self.best_score:
+            return False
+        if face_img is None or face_img.size == 0 or not cv2.imwrite(self.pending_path, face_img):
+            return False
+        self.best_score = float(score)
+        return True
+
+    def confirm(self, recognizer, max_learned=30, duplicate_threshold=0.93):
+        if not self.pending_path or not os.path.exists(self.pending_path):
+            return {"status": "invalid", "message": "没有可学习的待确认照片"}
+        image = cv2.imread(self.pending_path)
+        result = recognizer.learn_face(
+            image, max_learned=max_learned,
+            duplicate_threshold=duplicate_threshold)
+        if result.get("status") in ("learned", "duplicate"):
+            self.reject()
+        return result
+
+    def reject(self):
+        if not self.pending_path:
+            return False
+        path = self.pending_path
+        self.pending_path = None
+        self.best_score = -1.0
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 # ---------------- 切屏 (win32) ----------------
@@ -462,10 +617,12 @@ class CliCallbacks:
 
 def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
              stop_event=None, max_seconds=None, image_source=False,
-             restore_event=None):
+             restore_event=None, confirm_learn_event=None, reject_event=None):
     """检测/识别/状态机/切屏主循环, 命令行与 GUI 共用。
     cb 需实现: on_event(str), on_state(str), on_frame(ndarray) 返回 False 表示请求退出
-    restore_event 被置位时: 若处于防御态则手动恢复(用户确认老曹已走)
+    confirm_learn_event: 确认是老曹，学习本次照片后恢复。
+    reject_event: 确认是误报，删除本次照片后恢复。
+    restore_event 保留给命令行 R 键，仅恢复、不参与学习。
     cfg 为共享引用: 每帧重读 fps/阈值/roi 等, 设置可热更新"""
     interval = 1.0 / max(cfg.get("fps", 10), 1)
     if cfg.get("roi"):
@@ -485,6 +642,9 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     last_guard_check = 0.0
     prev_faces = []   # 上一帧脸的身份缓存 [(x1,y1,x2,y2,name,score)]: IoU 匹配沿用, 免重复识别
     cur_faces = []
+    review = None
+    best_hit_crop = None
+    best_hit_score = -1.0
 
     def finish():
         if state == "DEFEND":   # 退出时别把屏幕留在防御态
@@ -535,20 +695,27 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
         for x1, y1, x2, y2 in boxes:
             ratio = (y2 - y1) / h_frame
             name, score = None, -1.0
+            face_crop = None
             if x2 - x1 > 8 and y2 - y1 > 8:
+                # 紧框适合 YOLO，但五点对齐和待确认照片需要少量额头/下巴上下文。
+                fx1, fy1, fx2, fy2 = expand_face_box((x1, y1, x2, y2), frame.shape)
+                face_crop = frame[fy1:fy2, fx1:fx2].copy()
                 # 检测框和缓存框均为全画面坐标，所有 ROI 都能正确复用身份。
                 for pf in prev_faces:
                     if _iou((x1, y1, x2, y2), pf[:4]) > 0.4:
                         name, score = pf[4], pf[5]
                         break
                 if name is None:
-                    # 紧框适合 YOLO，但五点对齐需要保留少量额头/下巴上下文。
-                    fx1, fy1, fx2, fy2 = expand_face_box((x1, y1, x2, y2), frame.shape)
-                    name, score = recognizer.identify(frame[fy1:fy2, fx1:fx2])
+                    name, score = recognizer.identify(face_crop)
             hit = (score >= cfg["id_threshold"])
             suspected = (not hit and score >= cfg.get("alert_threshold", 0.35))
             if hit:
                 laocao_here = True
+                if face_crop is not None and score > best_hit_score:
+                    best_hit_crop = face_crop
+                    best_hit_score = float(score)
+                if state == "DEFEND" and review is not None:
+                    review.consider(face_crop, score)
                 color, label = (0, 0, 255), f"{name}! {score:.2f}"   # 红: 确认老曹
             elif suspected and ratio >= cfg["min_face_ratio"]:
                 suspected_here = True
@@ -591,6 +758,12 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             hit_streak += 1
             if state != "DEFEND" and hit_streak >= cfg["confirm_frames"]:
                 state = "DEFEND"
+                review = FaceReviewSession(cfg["gallery_dir"])
+                if review.start(best_hit_crop, best_hit_score):
+                    cb.on_event(
+                        f"[记录] 已保存本次识别照片 (相似度{best_hit_score:.2f})，等待人工确认")
+                else:
+                    cb.on_event("[记录失败] 无法保存本次识别照片，仍可恢复界面")
                 if guard_cur:
                     orig_hwnd = switch_screen(guard_cur)
                     beep(1000, 600)
@@ -605,14 +778,51 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                     last_reassert = now
         else:
             hit_streak = 0
+            if state != "DEFEND":
+                best_hit_crop = None
+                best_hit_score = -1.0
 
-        # ---- 手动恢复: 用户确认老曹已走 ----
-        if restore_event is not None and restore_event.is_set():
+        # ---- 人工复核并恢复 ----
+        confirm_requested = confirm_learn_event is not None and confirm_learn_event.is_set()
+        reject_requested = reject_event is not None and reject_event.is_set()
+        restore_requested = restore_event is not None and restore_event.is_set()
+        if confirm_requested:
+            confirm_learn_event.clear()
+        if reject_requested:
+            reject_event.clear()
+        if restore_requested:
             restore_event.clear()
+        if confirm_requested or reject_requested or restore_requested:
             if state == "DEFEND":
+                if confirm_requested:
+                    result = (review.confirm(
+                        recognizer,
+                        max_learned=cfg.get("max_learned_photos", 30),
+                        duplicate_threshold=cfg.get("learned_duplicate_threshold", 0.93))
+                        if review is not None else
+                        {"status": "invalid", "message": "没有可学习的待确认照片"})
+                    status = result.get("status")
+                    if status == "learned":
+                        cb.on_event(
+                            f"[学习] 已确认是老曹并加入图库: {os.path.basename(result['path'])}")
+                    elif status == "duplicate":
+                        cb.on_event(
+                            f"[学习] 与已有照片过于相似 ({result.get('similarity', 0):.2f})，无需重复入库")
+                    else:
+                        cb.on_event(f"[学习失败] {result.get('message', '未知错误')}，本次照片已保留")
+                elif reject_requested:
+                    deleted = review.reject() if review is not None else False
+                    cb.on_event("[误报] 已删除本次识别照片" if deleted
+                                else "[误报] 本次没有待删除的识别照片")
                 restore_screen(guard_cur, orig_hwnd)
                 state = "PATROL"
-                cb.on_event("[恢复] 已手动确认老曹离开, 切回原界面")
+                review = None
+                best_hit_crop = None
+                best_hit_score = -1.0
+                if restore_requested and not confirm_requested and not reject_requested:
+                    cb.on_event("[恢复] 已手动确认老曹离开, 切回原界面")
+                else:
+                    cb.on_event("[恢复] 人工复核完成，已切回原界面")
             else:
                 cb.on_event("[恢复] 当前不在防御态, 无需恢复")
         if state != "DEFEND":            # 非防御态: 疑似/警戒/巡逻自动切换

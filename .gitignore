@@ -1,0 +1,27 @@
+# 打包产物
+build/
+build_*/
+dist/
+dist2/
+dist_*/
+build_log.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Mimosa 本地扫描数据
+.mimosa/
+
+# 隐私: 老师照片与人脸特征数据, 严禁入库
+laocao/*
+!laocao/README.md
+
+# 个人本地配置(含个人窗口标题等), 提供模板代替
+config.json
+
+# 临时输出
+test_out.txt
+exe_test.png
+ui_test.png
+*.zip

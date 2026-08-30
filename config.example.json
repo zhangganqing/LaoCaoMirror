@@ -1,0 +1,18 @@
+{
+  "camera_index": 0,
+  "camera_resolution": [1920, 1080],
+  "mirror": true,
+  "fps": 10,
+  "max_frame_size": 1920,
+  "detect_imgsz": 960,
+  "roi": null,
+  "min_face_ratio": 0.05,
+  "alert_threshold": 0.35,
+  "id_threshold": 0.5,
+  "confirm_frames": 3,
+  "cooldown_seconds": 25,
+  "beep_alert": true,
+  "guard_window_keyword": "",
+  "gallery_dir": "laocao",
+  "models_dir": "models"
+}

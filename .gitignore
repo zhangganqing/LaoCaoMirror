@@ -13,9 +13,10 @@ __pycache__/
 # Mimosa 本地扫描数据
 .mimosa/
 
-# 隐私: 老师照片与人脸特征数据, 严禁入库
-laocao/*
-!laocao/README.md
+# 7 张公开参考照片随仓库分发；运行生成的数据不入库
+laocao/.pending/
+laocao/face_cache.json
+laocao/learned_*
 
 # 个人本地配置(含个人窗口标题等), 提供模板代替
 config.json

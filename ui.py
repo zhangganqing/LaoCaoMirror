@@ -57,20 +57,10 @@ class Engine(QThread):
         self.last_frame = None
         self._stop = threading.Event()
         self._restore = threading.Event()
-        self._confirm_learn = threading.Event()
-        self._reject = threading.Event()
 
     def confirm_restore(self):
         """命令行/旧调用兼容：仅恢复，不学习。"""
         self._restore.set()
-
-    def confirm_and_learn(self):
-        """用户确认识别正确：学习本次照片并恢复。"""
-        self._confirm_learn.set()
-
-    def reject_and_restore(self):
-        """用户确认是误报：删除本次照片并恢复。"""
-        self._reject.set()
 
     def run(self):
         try:
@@ -93,9 +83,7 @@ class Engine(QThread):
         cb = _EngineCb(self)
         try:
             core.run_loop(self.cfg, cap, detector, recognizer, guard_hwnd,
-                          cb, stop_event=self._stop, restore_event=self._restore,
-                          confirm_learn_event=self._confirm_learn,
-                          reject_event=self._reject)
+                          cb, stop_event=self._stop, restore_event=self._restore)
         except Exception as e:
             self.event_ready.emit(f"[错误] 引擎异常: {e}")
         self.engine_stopped.emit()
@@ -131,7 +119,7 @@ STATE_TEXT = {
     "PATROL": ("🟢 巡逻中 · 安全", "#1f7a2f", "#e8f6e8"),
     "ALERT": ("🟡 有人靠近 · 警戒", "#9a6b00", "#fff5dd"),
     "SUSPECT": ("🟠 疑似老曹 · 提高警惕", "#c06000", "#ffedd9"),
-    "DEFEND": ("🔴 已切屏 · 请确认识别结果", "#a11212", "#fde3e3"),
+    "DEFEND": ("🔴 已切屏 · 老曹走后恢复", "#a11212", "#fde3e3"),
 }
 
 
@@ -345,6 +333,7 @@ class MainWindow(QMainWindow):
         self.engine = None
         self.defend_count = 0
         self.screenshot_path = screenshot_path
+        self.review_queue = core.ReviewQueue(self.cfg["gallery_dir"])
 
         central = QWidget()
         root = QHBoxLayout(central)
@@ -376,16 +365,15 @@ class MainWindow(QMainWindow):
         self.btn_toggle = QPushButton("启动巡逻")
         self.btn_toggle.clicked.connect(self.toggle_engine)
         btns.addWidget(self.btn_toggle)
-        self.btn_confirm_learn = QPushButton("确认是老曹 · 学习并恢复")
-        self.btn_confirm_learn.setStyleSheet("font-weight:bold; color:#176b2c;")
-        self.btn_confirm_learn.setEnabled(False)
-        self.btn_confirm_learn.clicked.connect(self.confirm_and_learn)
-        btns.addWidget(self.btn_confirm_learn)
-        self.btn_reject = QPushButton("误报 · 删除并恢复")
-        self.btn_reject.setStyleSheet("font-weight:bold; color:#9a3b00;")
-        self.btn_reject.setEnabled(False)
-        self.btn_reject.clicked.connect(self.reject_and_restore)
-        btns.addWidget(self.btn_reject)
+        self.btn_restore = QPushButton("老曹已走 · 恢复界面")
+        self.btn_restore.setStyleSheet("font-weight:bold;")
+        self.btn_restore.setEnabled(False)
+        self.btn_restore.clicked.connect(self.manual_restore)
+        btns.addWidget(self.btn_restore)
+        self.btn_review = QPushButton()
+        self.btn_review.clicked.connect(self.open_review)
+        btns.addWidget(self.btn_review)
+        self.refresh_review_count()
         self.btn_roi = QPushButton("框选检测区")
         self.btn_roi.clicked.connect(self.pick_roi)
         btns.addWidget(self.btn_roi)
@@ -450,26 +438,20 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet(
             f"font-size:17px; font-weight:bold; color:{fg}; background:{bg};"
             " border-radius:6px; padding:6px;")
-        waiting_review = state == "DEFEND"
-        self.btn_confirm_learn.setEnabled(waiting_review)
-        self.btn_reject.setEnabled(waiting_review)
-
-    def confirm_and_learn(self):
-        if self.engine:
-            self.engine.confirm_and_learn()
-            self.btn_confirm_learn.setEnabled(False)
-            self.btn_reject.setEnabled(False)
-
-    def reject_and_restore(self):
-        if self.engine:
-            self.engine.reject_and_restore()
-            self.btn_confirm_learn.setEnabled(False)
-            self.btn_reject.setEnabled(False)
+        self.btn_restore.setEnabled(state == "DEFEND")
 
     def manual_restore(self):
-        """兼容旧测试和外部调用：只恢复，不把未确认照片加入图库。"""
+        """只恢复界面；识别照片继续留在批量审核队列。"""
         if self.engine:
             self.engine.confirm_restore()
+            self.btn_restore.setEnabled(False)
+
+    def refresh_review_count(self):
+        count = len(self.review_queue.list_items())
+        self.btn_review.setText(f"审核记录 ({count})")
+
+    def open_review(self):
+        self.log_event("[审核] 批量审核界面正在加载")
 
     def log_event(self, text):
         from datetime import datetime
@@ -487,6 +469,8 @@ class MainWindow(QMainWindow):
         if text.startswith("[防御]") and "已切屏" in text:
             self.defend_count += 1
             self.counter.setText(f"今日防御次数: {self.defend_count}")
+        if text.startswith("[记录]"):
+            self.refresh_review_count()
 
     # ---- ROI 框选 ----
     def pick_roi(self):

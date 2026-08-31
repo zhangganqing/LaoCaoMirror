@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """人工确认学习：待审照片、去重、热更新与自动样本上限。"""
 import os
-import inspect
 import tempfile
 import threading
 import unittest
@@ -121,8 +120,8 @@ class FaceGalleryLearningTests(unittest.TestCase):
 
 
 class _LoopCapture:
-    def __init__(self, decision_event):
-        self.decision_event = decision_event
+    def __init__(self, restore_event):
+        self.restore_event = restore_event
         self.state = None
         self.seen_defend = False
         self.events = []
@@ -134,7 +133,7 @@ class _LoopCapture:
         self.state = state
         if state == "DEFEND" and not self.seen_defend:
             self.seen_defend = True
-            self.decision_event.set()
+            self.restore_event.set()
 
     def on_frame(self, _frame):
         return not (self.seen_defend and self.state == "PATROL")
@@ -169,45 +168,39 @@ class _LoopRecognizer:
         return {"status": self.learning_status, "path": "learned_test.jpg"}
 
 
-class ReviewDecisionPipelineTests(unittest.TestCase):
+class ReviewQueuePipelineTests(unittest.TestCase):
     def _cfg(self, gallery_dir):
         cfg = dict(core.DEFAULTS)
         cfg.update({"gallery_dir": gallery_dir, "fps": 1000, "confirm_frames": 1,
                     "roi": None, "mirror": False, "guard_window_keyword": ""})
         return cfg
 
-    def _run_decision(self, decision):
-        params = inspect.signature(core.run_loop).parameters
-        self.assertIn("confirm_learn_event", params, "确认学习事件尚未接入状态机")
-        self.assertIn("reject_event", params, "误报删除事件尚未接入状态机")
+    def _run_once(self, gallery_dir):
+        restore_event = threading.Event()
+        cb = _LoopCapture(restore_event)
+        recognizer = _LoopRecognizer()
+        with patch.object(core, "beep"), patch.object(core, "restore_screen"):
+            core.run_loop(
+                self._cfg(gallery_dir), _LoopCaptureSource(), _LoopDetector(),
+                recognizer, None, cb, restore_event=restore_event)
+        return recognizer, cb.events
+
+    def test_restore_does_not_learn_or_delete_queued_photo(self):
         with tempfile.TemporaryDirectory() as gallery_dir:
-            confirm_event = threading.Event()
-            reject_event = threading.Event()
-            selected = confirm_event if decision == "confirm" else reject_event
-            cb = _LoopCapture(selected)
-            recognizer = _LoopRecognizer()
-            with patch.object(core, "beep"), patch.object(core, "restore_screen"):
-                core.run_loop(
-                    self._cfg(gallery_dir), _LoopCaptureSource(), _LoopDetector(),
-                    recognizer, None, cb, confirm_learn_event=confirm_event,
-                    reject_event=reject_event)
-            pending_dir = os.path.join(gallery_dir, ".pending")
-            pending = os.listdir(pending_dir) if os.path.isdir(pending_dir) else []
-            return recognizer, cb.events, pending
+            recognizer, events = self._run_once(gallery_dir)
+            items = core.ReviewQueue(gallery_dir).list_items()
 
-    def test_confirm_learns_then_restores_and_clears_pending_photo(self):
-        recognizer, events, pending = self._run_decision("confirm")
-        self.assertEqual(recognizer.learn_calls, 1)
-        self.assertTrue(any("[学习]" in text for text in events))
-        self.assertTrue(any("[恢复]" in text for text in events))
-        self.assertEqual(pending, [])
+            self.assertEqual(recognizer.learn_calls, 0)
+            self.assertEqual(len(items), 1)
+            self.assertTrue(any("[记录]" in text and "待审核" in text for text in events))
+            self.assertTrue(any("[恢复]" in text for text in events))
 
-    def test_false_positive_deletes_without_learning_then_restores(self):
-        recognizer, events, pending = self._run_decision("reject")
-        self.assertEqual(recognizer.learn_calls, 0)
-        self.assertTrue(any("[误报]" in text for text in events))
-        self.assertTrue(any("[恢复]" in text for text in events))
-        self.assertEqual(pending, [])
+    def test_two_defense_events_accumulate_two_review_records(self):
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            self._run_once(gallery_dir)
+            self._run_once(gallery_dir)
+
+            self.assertEqual(len(core.ReviewQueue(gallery_dir).list_items()), 2)
 
 
 if __name__ == "__main__":

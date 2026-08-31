@@ -709,12 +709,10 @@ class CliCallbacks:
 
 def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
              stop_event=None, max_seconds=None, image_source=False,
-             restore_event=None, confirm_learn_event=None, reject_event=None):
+             restore_event=None):
     """检测/识别/状态机/切屏主循环, 命令行与 GUI 共用。
     cb 需实现: on_event(str), on_state(str), on_frame(ndarray) 返回 False 表示请求退出
-    confirm_learn_event: 确认是老曹，学习本次照片后恢复。
-    reject_event: 确认是误报，删除本次照片后恢复。
-    restore_event 保留给命令行 R 键，仅恢复、不参与学习。
+    restore_event 只负责恢复界面；真假判断统一留到持久化审核队列处理。
     cfg 为共享引用: 每帧重读 fps/阈值/roi 等, 设置可热更新"""
     interval = 1.0 / max(cfg.get("fps", 10), 1)
     if cfg.get("roi"):
@@ -734,7 +732,8 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     last_guard_check = 0.0
     prev_faces = []   # 上一帧脸的身份缓存 [(x1,y1,x2,y2,name,score)]: IoU 匹配沿用, 免重复识别
     cur_faces = []
-    review = None
+    review_queue = ReviewQueue(cfg["gallery_dir"])
+    review_record_id = None
     best_hit_crop = None
     best_hit_score = -1.0
 
@@ -806,8 +805,8 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                 if face_crop is not None and score > best_hit_score:
                     best_hit_crop = face_crop
                     best_hit_score = float(score)
-                if state == "DEFEND" and review is not None:
-                    review.consider(face_crop, score)
+                if state == "DEFEND" and review_record_id is not None:
+                    review_queue.consider(review_record_id, face_crop, score)
                 color, label = (0, 0, 255), f"{name}! {score:.2f}"   # 红: 确认老曹
             elif suspected and ratio >= cfg["min_face_ratio"]:
                 suspected_here = True
@@ -850,10 +849,11 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             hit_streak += 1
             if state != "DEFEND" and hit_streak >= cfg["confirm_frames"]:
                 state = "DEFEND"
-                review = FaceReviewSession(cfg["gallery_dir"])
-                if review.start(best_hit_crop, best_hit_score):
+                review_record_id = review_queue.start_event(best_hit_crop, best_hit_score)
+                if review_record_id:
                     cb.on_event(
-                        f"[记录] 已保存本次识别照片 (相似度{best_hit_score:.2f})，等待人工确认")
+                        f"[记录] 已加入待审核队列 (相似度{best_hit_score:.2f}，"
+                        f"共{len(review_queue.list_items())}条)")
                 else:
                     cb.on_event("[记录失败] 无法保存本次识别照片，仍可恢复界面")
                 if guard_cur:
@@ -874,47 +874,18 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                 best_hit_crop = None
                 best_hit_score = -1.0
 
-        # ---- 人工复核并恢复 ----
-        confirm_requested = confirm_learn_event is not None and confirm_learn_event.is_set()
-        reject_requested = reject_event is not None and reject_event.is_set()
+        # ---- 手动恢复：记录继续留在审核队列，不在这里判断真假 ----
         restore_requested = restore_event is not None and restore_event.is_set()
-        if confirm_requested:
-            confirm_learn_event.clear()
-        if reject_requested:
-            reject_event.clear()
         if restore_requested:
             restore_event.clear()
-        if confirm_requested or reject_requested or restore_requested:
+        if restore_requested:
             if state == "DEFEND":
-                if confirm_requested:
-                    result = (review.confirm(
-                        recognizer,
-                        max_learned=cfg.get("max_learned_photos", 30),
-                        duplicate_threshold=cfg.get("learned_duplicate_threshold", 0.93))
-                        if review is not None else
-                        {"status": "invalid", "message": "没有可学习的待确认照片"})
-                    status = result.get("status")
-                    if status == "learned":
-                        cb.on_event(
-                            f"[学习] 已确认是老曹并加入图库: {os.path.basename(result['path'])}")
-                    elif status == "duplicate":
-                        cb.on_event(
-                            f"[学习] 与已有照片过于相似 ({result.get('similarity', 0):.2f})，无需重复入库")
-                    else:
-                        cb.on_event(f"[学习失败] {result.get('message', '未知错误')}，本次照片已保留")
-                elif reject_requested:
-                    deleted = review.reject() if review is not None else False
-                    cb.on_event("[误报] 已删除本次识别照片" if deleted
-                                else "[误报] 本次没有待删除的识别照片")
                 restore_screen(guard_cur, orig_hwnd)
                 state = "PATROL"
-                review = None
+                review_record_id = None
                 best_hit_crop = None
                 best_hit_score = -1.0
-                if restore_requested and not confirm_requested and not reject_requested:
-                    cb.on_event("[恢复] 已手动确认老曹离开, 切回原界面")
-                else:
-                    cb.on_event("[恢复] 人工复核完成，已切回原界面")
+                cb.on_event("[恢复] 已切回界面，识别照片保留在审核记录中")
             else:
                 cb.on_event("[恢复] 当前不在防御态, 无需恢复")
         if state != "DEFEND":            # 非防御态: 疑似/警戒/巡逻自动切换

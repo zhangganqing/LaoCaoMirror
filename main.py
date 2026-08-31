@@ -606,6 +606,14 @@ def restore_screen(guard_hwnd, orig_hwnd):
         switch_to(orig_hwnd)
 
 
+def toggle_desktop():
+    """发送 Win+D；用于未配置护身窗口时显示桌面，再次调用恢复窗口。"""
+    user32.keybd_event(0x5B, 0, 0, 0)   # Left Windows down
+    user32.keybd_event(0x44, 0, 0, 0)   # D down
+    user32.keybd_event(0x44, 0, 2, 0)   # D up
+    user32.keybd_event(0x5B, 0, 2, 0)   # Left Windows up
+
+
 def beep(freq, ms):
     try:
         winsound.Beep(freq, ms)
@@ -770,10 +778,14 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     review_record_id = None
     best_hit_crop = None
     best_hit_score = -1.0
+    desktop_fallback = False
 
     def finish():
         if state == "DEFEND":   # 退出时别把屏幕留在防御态
-            restore_screen(guard_cur, orig_hwnd)
+            if desktop_fallback:
+                toggle_desktop()
+            else:
+                restore_screen(guard_cur, orig_hwnd)
         cap.release()
         cv2.destroyAllWindows()
 
@@ -892,12 +904,15 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                     cb.on_event("[记录失败] 无法保存本次识别照片，仍可恢复界面")
                 if guard_cur:
                     orig_hwnd = switch_screen(guard_cur)
+                    desktop_fallback = False
                     beep(1000, 600)
                     cb.on_event(f"[防御] 老曹出现! 已切屏 (老曹离开后点\"恢复界面\"/按 R 切回)")
                 else:
+                    toggle_desktop()
+                    desktop_fallback = True
                     beep(1000, 600)
-                    cb.on_event("[防御] 老曹出现! 但未配置护身窗口, 无法切屏")
-            elif state == "DEFEND" and guard_cur:
+                    cb.on_event("[防御] 老曹出现! 未配置护身窗口，已显示桌面")
+            elif state == "DEFEND" and guard_cur and not desktop_fallback:
                 # 防御期间保活: 焦点被意外抢走时拉回护身窗口
                 if now - last_reassert > 1.0 and user32.GetForegroundWindow() != guard_cur:
                     switch_to(guard_cur)
@@ -914,8 +929,12 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             restore_event.clear()
         if restore_requested:
             if state == "DEFEND":
-                restore_screen(guard_cur, orig_hwnd)
+                if desktop_fallback:
+                    toggle_desktop()
+                else:
+                    restore_screen(guard_cur, orig_hwnd)
                 state = "PATROL"
+                desktop_fallback = False
                 review_record_id = None
                 best_hit_crop = None
                 best_hit_score = -1.0

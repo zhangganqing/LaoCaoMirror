@@ -46,6 +46,12 @@ torch.set_num_threads(2)   # 不限制时 torch 会把全部核心拉去并行�
 DEFAULTS = {
     "camera_index": 0,
     "camera_resolution": [1920, 1080],  # 摄像头采集分辨率(设置里可选), 实际以摄像头支持为准
+    "camera_autofocus": True,      # 关闭后可把焦点手动锁在后方通道
+    "camera_focus": 160,           # 驱动常见范围 0~255；不支持时安全忽略
+    "camera_auto_exposure": True,
+    "camera_exposure": -6,         # Windows 摄像头常见范围 -13~-1
+    "camera_backlight": 0,         # 逆光补偿，常见 0/1
+    "detection_equalize": False,   # 仅增强检测副本，不改变原始预览
     "mirror": True,
     "fps": 10,                # 主循环帧率上限(检测+预览)。老曹是慢慢摸上来的, 降到 5 更省电(3帧确认≈0.6s)
     "max_frame_size": 1920,   # 进入检测的分辨率上限(长边); 摄像头请求 1080p, 一般不触发缩放
@@ -353,64 +359,6 @@ class FaceRecognizer:
             return None, -1.0
         name = max(self.gallery, key=lambda k: float(self.gallery[k] @ e))
         return name, float(self.gallery[name] @ e)
-
-
-class FaceReviewSession:
-    """一次防御事件对应的一张待人工确认照片，始终保留分数最高的脸。"""
-
-    def __init__(self, gallery_dir):
-        self.pending_dir = os.path.join(gallery_dir, ".pending")
-        self.pending_path = None
-        self.best_score = -1.0
-
-    def start(self, face_img, score, now=None):
-        if face_img is None or face_img.size == 0:
-            return False
-        os.makedirs(self.pending_dir, exist_ok=True)
-        stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        self.pending_path = os.path.join(self.pending_dir, f"pending_{stamp}.jpg")
-        suffix = 1
-        while os.path.exists(self.pending_path):
-            self.pending_path = os.path.join(
-                self.pending_dir, f"pending_{stamp}_{suffix}.jpg")
-            suffix += 1
-        self.best_score = float(score)
-        if not cv2.imwrite(self.pending_path, face_img):
-            self.pending_path = None
-            self.best_score = -1.0
-            return False
-        return True
-
-    def consider(self, face_img, score):
-        if self.pending_path is None or score <= self.best_score:
-            return False
-        if face_img is None or face_img.size == 0 or not cv2.imwrite(self.pending_path, face_img):
-            return False
-        self.best_score = float(score)
-        return True
-
-    def confirm(self, recognizer, max_learned=30, duplicate_threshold=0.93):
-        if not self.pending_path or not os.path.exists(self.pending_path):
-            return {"status": "invalid", "message": "没有可学习的待确认照片"}
-        image = cv2.imread(self.pending_path)
-        result = recognizer.learn_face(
-            image, max_learned=max_learned,
-            duplicate_threshold=duplicate_threshold)
-        if result.get("status") in ("learned", "duplicate"):
-            self.reject()
-        return result
-
-    def reject(self):
-        if not self.pending_path:
-            return False
-        path = self.pending_path
-        self.pending_path = None
-        self.best_score = -1.0
-        try:
-            os.remove(path)
-            return True
-        except FileNotFoundError:
-            return False
 
 
 class ReviewQueue:
@@ -779,6 +727,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     best_hit_crop = None
     best_hit_score = -1.0
     desktop_fallback = False
+    camera_signature = None
 
     def finish():
         if state == "DEFEND":   # 退出时别把屏幕留在防御态
@@ -799,6 +748,14 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
         elif remaining > 0:
             time.sleep(remaining)
         t_frame = time.time()
+        next_camera_signature = tuple(cfg.get(key) for key in (
+            "camera_autofocus", "camera_focus", "camera_auto_exposure",
+            "camera_exposure", "camera_backlight"))
+        if next_camera_signature != camera_signature:
+            camera_report = apply_camera_controls(cap, cfg)
+            camera_signature = next_camera_signature
+            if camera_report["unsupported"]:
+                cb.on_event("[摄像头] 驱动不支持: " + ", ".join(camera_report["unsupported"]))
         if max_seconds and time.time() - t_start > max_seconds:
             cb.on_event(f"[结束] 达到限时 {max_seconds}s, 正常退出")
             finish()
@@ -813,6 +770,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             finish()
             return
         frame = preprocess(frame, cfg)
+        detection_frame = prepare_detection_frame(frame, cfg)
 
         rois = cfg.get("roi")   # 每帧重读, 框选确认后下一帧即生效, 无需重启引擎
         if rois:
@@ -828,7 +786,8 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
         h_frame = frame.shape[0]
         cur_faces = []
 
-        boxes = detect_faces(detector, frame, rois, imgsz=cfg.get("detect_imgsz", 960))
+        boxes = detect_faces(detector, detection_frame, rois,
+                             imgsz=cfg.get("detect_imgsz", 960))
         for x1, y1, x2, y2 in boxes:
             ratio = (y2 - y1) / h_frame
             name, score = None, -1.0
@@ -836,7 +795,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             if x2 - x1 > 8 and y2 - y1 > 8:
                 # 紧框适合 YOLO，但五点对齐和待确认照片需要少量额头/下巴上下文。
                 fx1, fy1, fx2, fy2 = expand_face_box((x1, y1, x2, y2), frame.shape)
-                face_crop = frame[fy1:fy2, fx1:fx2].copy()
+                face_crop = detection_frame[fy1:fy2, fx1:fx2].copy()
                 # 检测框和缓存框均为全画面坐标，所有 ROI 都能正确复用身份。
                 for pf in prev_faces:
                     if _iou((x1, y1, x2, y2), pf[:4]) > 0.4:
@@ -996,6 +955,51 @@ def open_source(source, cfg):
         print(f"[错误] 无法读取 {source}")
         sys.exit(1)
     return cap
+
+
+def apply_camera_controls(cap, cfg):
+    """尽力应用摄像头驱动属性，返回实际值和不支持项；不支持时不抛异常。"""
+    report = {"actual": {}, "unsupported": [], "skipped": False}
+    if not hasattr(cap, "set") or not hasattr(cap, "get"):
+        report["skipped"] = True
+        return report
+
+    settings = [
+        ("autofocus", cv2.CAP_PROP_AUTOFOCUS,
+         1.0 if cfg.get("camera_autofocus", True) else 0.0),
+        ("auto_exposure", cv2.CAP_PROP_AUTO_EXPOSURE,
+         0.75 if cfg.get("camera_auto_exposure", True) else 0.25),
+        ("backlight", cv2.CAP_PROP_BACKLIGHT,
+         float(cfg.get("camera_backlight", 0))),
+    ]
+    if not cfg.get("camera_autofocus", True):
+        settings.insert(1, ("focus", cv2.CAP_PROP_FOCUS,
+                            float(cfg.get("camera_focus", 160))))
+    if not cfg.get("camera_auto_exposure", True):
+        settings.insert(-1, ("exposure", cv2.CAP_PROP_EXPOSURE,
+                             float(cfg.get("camera_exposure", -6))))
+
+    for name, prop, value in settings:
+        try:
+            if cap.set(prop, value):
+                report["actual"][name] = float(cap.get(prop))
+            else:
+                report["unsupported"].append(name)
+        except Exception:
+            report["unsupported"].append(name)
+    return report
+
+
+def prepare_detection_frame(frame, cfg):
+    """为检测生成可选的局部对比度增强副本，不修改预览原图。"""
+    if not cfg.get("detection_equalize", False):
+        return frame
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    lightness, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(lightness)
+    return cv2.cvtColor(
+        cv2.merge((enhanced, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
 
 
 class ImageSource:

@@ -15,6 +15,7 @@ __pycache__/
 
 # 7 张公开参考照片随仓库分发；运行生成的数据不入库
 laocao/.pending/
+laocao/review_queue/
 laocao/face_cache.json
 laocao/learned_*
 

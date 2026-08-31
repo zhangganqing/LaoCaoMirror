@@ -1,6 +1,12 @@
 {
   "camera_index": 0,
   "camera_resolution": [1920, 1080],
+  "camera_autofocus": true,
+  "camera_focus": 160,
+  "camera_auto_exposure": true,
+  "camera_exposure": -6,
+  "camera_backlight": 0,
+  "detection_equalize": false,
   "mirror": true,
   "fps": 10,
   "max_frame_size": 1920,

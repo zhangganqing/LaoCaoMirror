@@ -33,25 +33,6 @@ def _recognizer_without_models(gallery_dir, embeddings, candidate_embedding):
     return recognizer
 
 
-class FaceReviewSessionTests(unittest.TestCase):
-    def test_keeps_the_highest_score_crop_and_reject_deletes_it(self):
-        self.assertTrue(hasattr(core, "FaceReviewSession"), "待确认记录功能尚未实现")
-        with tempfile.TemporaryDirectory() as gallery_dir:
-            review = core.FaceReviewSession(gallery_dir)
-            low = np.full((20, 20, 3), 30, dtype=np.uint8)
-            high = np.full((20, 20, 3), 220, dtype=np.uint8)
-
-            self.assertTrue(review.start(low, 0.55, now=datetime(2026, 8, 30, 19, 0, 0)))
-            pending_path = review.pending_path
-            self.assertFalse(review.consider(high, 0.50))
-            self.assertTrue(review.consider(high, 0.80))
-            saved = cv2.imread(pending_path)
-
-            self.assertGreater(float(saved.mean()), 200)
-            self.assertTrue(review.reject())
-            self.assertFalse(os.path.exists(pending_path))
-
-
 class FaceGalleryLearningTests(unittest.TestCase):
     def test_confirm_promotes_photo_and_updates_gallery_without_restart(self):
         self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "图库热学习尚未实现")

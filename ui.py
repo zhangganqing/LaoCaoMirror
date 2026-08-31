@@ -238,6 +238,8 @@ class RoiDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
+    camera_preview = pyqtSignal(object)
+
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
@@ -248,7 +250,7 @@ class SettingsDialog(QDialog):
 
         self.win_box = QComboBox()
         wins = list_visible_windows()
-        self.win_box.addItem("(不启用切屏, 仅提醒)", None)
+        self.win_box.addItem("(不选择：检测时显示桌面)", None)
         cur = cfg.get("guard_window_keyword")
         for t in wins:
             self.win_box.addItem(t, t)
@@ -291,6 +293,37 @@ class SettingsDialog(QDialog):
         self.res.setCurrentIndex(idx_res.get(tuple(cur_res), 2))
         form.addRow("摄像头分辨率:", self.res)
 
+        self.autofocus = QCheckBox("自动对焦")
+        self.autofocus.setChecked(cfg.get("camera_autofocus", True))
+        form.addRow("对焦模式:", self.autofocus)
+        self.focus = QSpinBox(); self.focus.setRange(0, 255)
+        self.focus.setValue(int(cfg.get("camera_focus", 160)))
+        self.focus.setEnabled(not self.autofocus.isChecked())
+        self.autofocus.toggled.connect(lambda checked: self.focus.setEnabled(not checked))
+        form.addRow("手动焦距 (后方优先):", self.focus)
+
+        self.auto_exposure = QCheckBox("自动曝光")
+        self.auto_exposure.setChecked(cfg.get("camera_auto_exposure", True))
+        form.addRow("曝光模式:", self.auto_exposure)
+        self.exposure = QSpinBox(); self.exposure.setRange(-13, -1)
+        self.exposure.setValue(int(cfg.get("camera_exposure", -6)))
+        self.exposure.setEnabled(not self.auto_exposure.isChecked())
+        self.auto_exposure.toggled.connect(
+            lambda checked: self.exposure.setEnabled(not checked))
+        form.addRow("手动曝光 (越小越暗):", self.exposure)
+
+        self.backlight = QCheckBox("启用逆光补偿")
+        self.backlight.setChecked(bool(cfg.get("camera_backlight", 0)))
+        form.addRow("", self.backlight)
+        self.equalize = QCheckBox("检测时增强阴影细节 (不改变预览)")
+        self.equalize.setChecked(cfg.get("detection_equalize", False))
+        form.addRow("", self.equalize)
+
+        for control in (self.autofocus, self.focus, self.auto_exposure,
+                        self.exposure, self.backlight, self.equalize):
+            signal = control.toggled if isinstance(control, QCheckBox) else control.valueChanged
+            signal.connect(self._emit_camera_preview)
+
         self.beep = QCheckBox("有人靠近时提示音"); self.beep.setChecked(cfg["beep_alert"])
         form.addRow("", self.beep)
         self.mirror = QCheckBox("镜像预览(后视镜观感)"); self.mirror.setChecked(cfg["mirror"])
@@ -307,6 +340,19 @@ class SettingsDialog(QDialog):
         bb.rejected.connect(self.reject)
         form.addRow(bb)
 
+    def _camera_values(self):
+        return {
+            "camera_autofocus": self.autofocus.isChecked(),
+            "camera_focus": self.focus.value(),
+            "camera_auto_exposure": self.auto_exposure.isChecked(),
+            "camera_exposure": self.exposure.value(),
+            "camera_backlight": 1 if self.backlight.isChecked() else 0,
+            "detection_equalize": self.equalize.isChecked(),
+        }
+
+    def _emit_camera_preview(self, _value=None):
+        self.camera_preview.emit(self._camera_values())
+
     def result_cfg(self):
         win = self.win_box.currentData()
         c = dict(self.cfg)
@@ -319,6 +365,7 @@ class SettingsDialog(QDialog):
         c["min_face_ratio"] = round(self.minr.value(), 2)
         c["camera_index"] = self.cam.value()
         c["camera_resolution"] = self.res.currentData()
+        c.update(self._camera_values())
         c["beep_alert"] = self.beep.isChecked()
         c["mirror"] = self.mirror.isChecked()
         return c
@@ -485,8 +532,8 @@ class MainWindow(QMainWindow):
 
         self.log_event("提示: 先在\"设置\"里选择护身窗口, 再启动巡逻")
         if not cfg.get("guard_window_keyword"):
-            self.log_event("⚠ 当前未配置护身窗口: 检测到老曹只会提醒, 不会切屏!")
-            self.log_event("  (设置→护身窗口→选择打开着的课件/文档)")
+            self.log_event("⚠ 当前未配置护身窗口: 检测到老曹将自动显示桌面")
+            self.log_event("  (也可在设置→护身窗口中选择打开着的课件/文档)")
 
         if self.screenshot_path:
             self.start_engine()
@@ -614,7 +661,9 @@ class MainWindow(QMainWindow):
 
     # ---- 设置 ----
     def open_settings(self):
+        previous_cfg = dict(self.cfg)
         dlg = SettingsDialog(self.cfg, self)
+        dlg.camera_preview.connect(self.preview_camera_controls)
         if dlg.exec():
             new_cfg = dlg.result_cfg()
             cam_changed = (self.engine is not None and (
@@ -630,6 +679,16 @@ class MainWindow(QMainWindow):
                 self.start_engine()
             else:
                 self.log_event("[设置] 已保存并即时生效")
+        else:
+            self.preview_camera_controls({
+                key: previous_cfg[key] for key in (
+                    "camera_autofocus", "camera_focus", "camera_auto_exposure",
+                    "camera_exposure", "camera_backlight", "detection_equalize")
+            })
+
+    def preview_camera_controls(self, values):
+        """设置窗口拖动时热更新共享配置；引擎下一帧应用摄像头属性。"""
+        self.cfg.update(values)
 
     def take_screenshot(self):
         pm = self.grab()

@@ -18,6 +18,8 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 
 # PyInstaller 打包(--windowed)后 stdout 为 None, print 会崩; 资源锚定到 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -409,6 +411,96 @@ class FaceReviewSession:
             return True
         except FileNotFoundError:
             return False
+
+
+class ReviewQueue:
+    """跨重启保存的识别审核队列；每个防御事件对应一张最佳脸照。"""
+
+    def __init__(self, gallery_dir):
+        self.review_dir = Path(gallery_dir) / "review_queue"
+
+    def _paths(self, record_id):
+        return (self.review_dir / f"{record_id}.jpg",
+                self.review_dir / f"{record_id}.json")
+
+    def _write_metadata(self, path, metadata):
+        temp_path = path.with_suffix(".json.tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+
+    def start_event(self, face_img, score, now=None):
+        if face_img is None or face_img.size == 0:
+            return None
+        created = now or datetime.now()
+        stamp = created.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        record_id = f"{stamp}_{uuid4().hex[:8]}"
+        self.review_dir.mkdir(parents=True, exist_ok=True)
+        image_path, metadata_path = self._paths(record_id)
+        if not cv2.imwrite(str(image_path), face_img):
+            return None
+        metadata = {
+            "id": record_id,
+            "created_at": created.isoformat(timespec="milliseconds"),
+            "score": float(score),
+            "image_name": image_path.name,
+        }
+        try:
+            self._write_metadata(metadata_path, metadata)
+        except Exception:
+            image_path.unlink(missing_ok=True)
+            return None
+        return record_id
+
+    def consider(self, record_id, face_img, score):
+        if not record_id or face_img is None or face_img.size == 0:
+            return False
+        image_path, metadata_path = self._paths(record_id)
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            if float(score) <= float(metadata["score"]):
+                return False
+            if not cv2.imwrite(str(image_path), face_img):
+                return False
+            metadata["score"] = float(score)
+            self._write_metadata(metadata_path, metadata)
+            return True
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return False
+
+    def list_items(self):
+        if not self.review_dir.is_dir():
+            return []
+        items = []
+        for metadata_path in self.review_dir.glob("*.json"):
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                record_id = str(metadata["id"])
+                image_path, expected_metadata_path = self._paths(record_id)
+                if expected_metadata_path != metadata_path or not image_path.is_file():
+                    continue
+                items.append({
+                    "id": record_id,
+                    "created_at": str(metadata["created_at"]),
+                    "score": float(metadata["score"]),
+                    "image_path": str(image_path),
+                })
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        return sorted(items, key=lambda item: item["created_at"], reverse=True)
+
+    def delete(self, record_ids):
+        deleted = 0
+        for record_id in dict.fromkeys(record_ids):
+            image_path, metadata_path = self._paths(record_id)
+            existed = image_path.exists() or metadata_path.exists()
+            image_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+            if existed:
+                deleted += 1
+        return deleted
 
 
 # ---------------- 切屏 (win32) ----------------

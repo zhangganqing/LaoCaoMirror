@@ -476,6 +476,9 @@ class MainWindow(QMainWindow):
         self.cfg = dict(cfg)
         self.source = source
         self.engine = None
+        self._restart_pending = False
+        self._closing = False
+        self._quit_pending = False
         self.defend_count = 0
         self.screenshot_path = screenshot_path
         self.review_queue = core.ReviewQueue(self.cfg["gallery_dir"])
@@ -547,28 +550,54 @@ class MainWindow(QMainWindow):
             self.start_engine()
 
     def start_engine(self):
-        self.engine = Engine(self.cfg, self.source)
-        self.engine.frame_ready.connect(self.show_frame)
-        self.engine.state_ready.connect(self.show_state)
-        self.engine.event_ready.connect(self.log_event)
-        self.engine.engine_stopped.connect(self.on_engine_stopped)
-        self.engine.start()
+        if self.engine is not None:
+            return
+        engine = Engine(self.cfg, self.source)
+        self.engine = engine
+        engine.frame_ready.connect(self.show_frame)
+        engine.state_ready.connect(self.show_state)
+        engine.event_ready.connect(self.log_event)
+        # 使用 QThread.finished：它只在线程 run() 真正返回后触发。捕获具体实例，
+        # 避免旧线程的迟到信号误清除刚启动的新线程。
+        engine.finished.connect(lambda engine=engine: self.on_engine_finished(engine))
+        engine.start()
+        self.btn_toggle.setEnabled(True)
         self.btn_toggle.setText("停止巡逻")
         self.status.setText("⚪ 启动中…")
         self.log_event("[引擎] 启动中, 预览几秒后恢复")
 
-    def stop_engine(self):
+    def stop_engine(self, restart=False):
+        """异步请求停止；绝不在 Qt 主线程等待摄像头驱动。"""
+        self._restart_pending = bool(restart)
         if self.engine:
             self.engine.stop()
-            if not self.engine.wait(3000):
-                self.log_event("[警告] 引擎停止超时, 强制继续")
-            self.engine = None
+            self.btn_toggle.setEnabled(False)
+            self.btn_toggle.setText("停止中…")
+            self.status.setText("⚪ 正在释放摄像头…")
+        elif restart:
+            self._restart_pending = False
+            self.start_engine()
 
-    def on_engine_stopped(self):
-        if self.engine is not None:   # 引擎自己报错退出时同步按钮
-            self.engine = None
-            self.btn_toggle.setText("启动巡逻")
-            self.status.setText("⚪ 未启动")
+    def restart_engine(self):
+        """旧引擎完全结束后再启动新引擎，避免两个线程争用摄像头。"""
+        self.stop_engine(restart=True)
+
+    def on_engine_finished(self, finished_engine):
+        if self.engine is not finished_engine:
+            return
+        self.engine = None
+        self.btn_toggle.setEnabled(True)
+        self.btn_toggle.setText("启动巡逻")
+        self.status.setText("⚪ 未启动")
+
+        restart = self._restart_pending
+        self._restart_pending = False
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+        elif self._quit_pending:
+            QTimer.singleShot(0, QApplication.quit)
+        elif restart:
+            self.start_engine()
 
     # ---- 信号槽 ----
     def show_frame(self, frame):
@@ -675,8 +704,7 @@ class MainWindow(QMainWindow):
             core.save_config(self.cfg)
             if cam_changed:
                 self.log_event("[设置] 已保存, 摄像头变更, 重启引擎…")
-                self.stop_engine()
-                self.start_engine()
+                self.restart_engine()
             else:
                 self.log_event("[设置] 已保存并即时生效")
         else:
@@ -693,11 +721,19 @@ class MainWindow(QMainWindow):
     def take_screenshot(self):
         pm = self.grab()
         pm.save(self.screenshot_path)
-        self.stop_engine()
-        QApplication.quit()
+        self._quit_pending = True
+        if self.engine:
+            self.stop_engine()
+        else:
+            QApplication.quit()
 
     def closeEvent(self, event):
-        self.stop_engine()
+        if self.engine:
+            self._closing = True
+            self._restart_pending = False
+            self.stop_engine()
+            event.ignore()
+            return
         event.accept()
 
 

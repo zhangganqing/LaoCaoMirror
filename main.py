@@ -62,6 +62,7 @@ DEFAULTS = {
     "id_threshold": 0.5,      # 切屏阈值: 超过则确认是老曹, 立即切屏
     "confirm_frames": 2,      # 连续命中 N 帧才切屏
     "cooldown_seconds": 25,   # 老曹离开后保持防御的时长
+    "review_rearm_seconds": 1.0,  # 连续未检出多久后，再出现时新建审核记录
     "beep_alert": True,       # 陌生人(认不出)提醒音
     "guard_window_keyword": "GuardWindow",  # 护身窗口标题关键字
     "gallery_dir": "laocao",  # 老曹照片文件夹(目录名=身份名)
@@ -729,6 +730,16 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     desktop_fallback = False
     camera_signature = None
 
+    def start_review_event():
+        nonlocal review_record_id
+        review_record_id = review_queue.start_event(best_hit_crop, best_hit_score)
+        if review_record_id:
+            cb.on_event(
+                f"[记录] 已加入待审核队列 (相似度{best_hit_score:.2f}，"
+                f"共{len(review_queue.list_items())}条)")
+        else:
+            cb.on_event("[记录失败] 无法保存本次识别照片，仍可恢复界面")
+
     def finish():
         if state == "DEFEND":   # 退出时别把屏幕留在防御态
             if desktop_fallback:
@@ -810,8 +821,6 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                 if face_crop is not None and score > best_hit_score:
                     best_hit_crop = face_crop
                     best_hit_score = float(score)
-                if state == "DEFEND" and review_record_id is not None:
-                    review_queue.consider(review_record_id, face_crop, score)
                 color, label = (0, 0, 255), f"{name}! {score:.2f}"   # 红: 确认老曹
             elif suspected and ratio >= cfg["min_face_ratio"]:
                 suspected_here = True
@@ -854,13 +863,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
             hit_streak += 1
             if state != "DEFEND" and hit_streak >= cfg["confirm_frames"]:
                 state = "DEFEND"
-                review_record_id = review_queue.start_event(best_hit_crop, best_hit_score)
-                if review_record_id:
-                    cb.on_event(
-                        f"[记录] 已加入待审核队列 (相似度{best_hit_score:.2f}，"
-                        f"共{len(review_queue.list_items())}条)")
-                else:
-                    cb.on_event("[记录失败] 无法保存本次识别照片，仍可恢复界面")
+                start_review_event()
                 if guard_cur:
                     orig_hwnd = switch_screen(guard_cur)
                     desktop_fallback = False
@@ -871,14 +874,28 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                     desktop_fallback = True
                     beep(1000, 600)
                     cb.on_event("[防御] 老曹出现! 未配置护身窗口，已显示桌面")
-            elif state == "DEFEND" and guard_cur and not desktop_fallback:
-                # 防御期间保活: 焦点被意外抢走时拉回护身窗口
-                if now - last_reassert > 1.0 and user32.GetForegroundWindow() != guard_cur:
-                    switch_to(guard_cur)
-                    last_reassert = now
+            elif state == "DEFEND":
+                if review_record_id is None:
+                    # 恢复界面与记录分段解耦：离开后再次出现即新建记录。
+                    start_review_event()
+                elif best_hit_crop is not None:
+                    review_queue.consider(
+                        review_record_id, best_hit_crop, best_hit_score)
+                if guard_cur and not desktop_fallback:
+                    # 防御期间保活: 焦点被意外抢走时拉回护身窗口
+                    if now - last_reassert > 1.0 and user32.GetForegroundWindow() != guard_cur:
+                        switch_to(guard_cur)
+                        last_reassert = now
         else:
             hit_streak = 0
-            if state != "DEFEND":
+            if state == "DEFEND":
+                rearm_seconds = max(float(cfg.get("review_rearm_seconds", 1.0)), 0.0)
+                if (review_record_id is not None and last_seen
+                        and now - last_seen >= rearm_seconds):
+                    review_record_id = None
+                    best_hit_crop = None
+                    best_hit_score = -1.0
+            else:
                 best_hit_crop = None
                 best_hit_score = -1.0
 

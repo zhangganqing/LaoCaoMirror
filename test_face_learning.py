@@ -136,6 +136,33 @@ class _LoopDetector:
         return np.array([[25, 20, 75, 80]])
 
 
+class _SequenceDetector:
+    def __init__(self, detections):
+        self.detections = iter(detections)
+
+    def detect(self, _frame, imgsz=960):
+        if next(self.detections):
+            return np.array([[25, 20, 75, 80]])
+        return np.empty((0, 4), dtype=np.float32)
+
+
+class _FrameLimitCapture:
+    def __init__(self, frame_count):
+        self.frame_count = frame_count
+        self.frames = 0
+        self.events = []
+
+    def on_event(self, text):
+        self.events.append(text)
+
+    def on_state(self, _state):
+        pass
+
+    def on_frame(self, _frame):
+        self.frames += 1
+        return self.frames < self.frame_count
+
+
 class _LoopRecognizer:
     def __init__(self, learning_status="learned"):
         self.learn_calls = 0
@@ -182,6 +209,22 @@ class ReviewQueuePipelineTests(unittest.TestCase):
             self._run_once(gallery_dir)
 
             self.assertEqual(len(core.ReviewQueue(gallery_dir).list_items()), 2)
+
+    def test_reappearance_creates_new_record_without_manual_restore(self):
+        """防御界面未恢复时，离开再出现仍应是新的审核事件。"""
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            detections = [True, True, False, True, True]
+            cb = _FrameLimitCapture(len(detections))
+            cfg = self._cfg(gallery_dir)
+            cfg["review_rearm_seconds"] = 0
+            with patch.object(core, "beep"), patch.object(core, "toggle_desktop"):
+                core.run_loop(
+                    cfg, _LoopCaptureSource(), _SequenceDetector(detections),
+                    _LoopRecognizer(), None, cb)
+
+            items = core.ReviewQueue(gallery_dir).list_items()
+            self.assertEqual(len(items), 2)
+            self.assertEqual(sum("[记录]" in event for event in cb.events), 2)
 
 
 if __name__ == "__main__":

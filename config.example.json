@@ -17,6 +17,7 @@
   "id_threshold": 0.5,
   "confirm_frames": 3,
   "cooldown_seconds": 25,
+  "review_rearm_seconds": 1.0,
   "beep_alert": true,
   "guard_window_keyword": "",
   "gallery_dir": "laocao",

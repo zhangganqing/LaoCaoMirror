@@ -502,6 +502,40 @@ class ReviewQueue:
                 deleted += 1
         return deleted
 
+    def confirm_many(self, record_ids, recognizer,
+                     max_learned=30, duplicate_threshold=0.93):
+        """批量确认是目标身份；成功或重复项移出队列，失败项保留。"""
+        result = {"learned": 0, "duplicate": 0, "invalid": 0, "error": 0}
+        available = {item["id"]: item for item in self.list_items()}
+        for record_id in dict.fromkeys(record_ids):
+            item = available.get(record_id)
+            if item is None:
+                result["error"] += 1
+                continue
+            image = cv2.imread(item["image_path"])
+            if image is None or image.size == 0:
+                result["invalid"] += 1
+                continue
+            try:
+                learned = recognizer.learn_face(
+                    image, max_learned=max_learned,
+                    duplicate_threshold=duplicate_threshold)
+            except Exception:
+                result["error"] += 1
+                continue
+            status = learned.get("status", "error")
+            if status in ("learned", "duplicate"):
+                result[status] += 1
+                self.delete([record_id])
+            elif status == "invalid":
+                result["invalid"] += 1
+            else:
+                result["error"] += 1
+        return result
+
+    def reject_many(self, record_ids):
+        return {"deleted": self.delete(record_ids)}
+
 
 # ---------------- 切屏 (win32) ----------------
 user32 = ctypes.windll.user32

@@ -11,11 +11,11 @@ import threading
 
 import cv2
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QPushButton, QRubberBand, QSpinBox,
+    QListView, QListWidgetItem, QMainWindow, QPushButton, QRubberBand, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
@@ -324,6 +324,104 @@ class SettingsDialog(QDialog):
         return c
 
 
+class ReviewDialog(QDialog):
+    """持久化识别记录的缩略图多选与批量处理窗口。"""
+    message_ready = pyqtSignal(str)
+
+    def __init__(self, queue, recognizer, max_learned=30,
+                 duplicate_threshold=0.93, parent=None):
+        super().__init__(parent)
+        self.queue = queue
+        self.recognizer = recognizer
+        self.max_learned = max_learned
+        self.duplicate_threshold = duplicate_threshold
+        self.setWindowTitle("审核识别记录")
+        self.resize(780, 560)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("勾选照片后批量处理；未勾选和学习失败的记录会继续保留。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.items = QListWidget()
+        self.items.setViewMode(QListView.ViewMode.IconMode)
+        self.items.setIconSize(QSize(180, 135))
+        self.items.setGridSize(QSize(210, 190))
+        self.items.setResizeMode(QListView.ResizeMode.Adjust)
+        self.items.setWordWrap(True)
+        layout.addWidget(self.items, 1)
+
+        self.result_label = QLabel("")
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
+
+        buttons = QHBoxLayout()
+        select_all = QPushButton("全选")
+        select_all.clicked.connect(self.select_all)
+        buttons.addWidget(select_all)
+        confirm = QPushButton("选中的是老曹 · 批量学习")
+        confirm.setStyleSheet("font-weight:bold; color:#176b2c;")
+        confirm.clicked.connect(self.confirm_selected)
+        buttons.addWidget(confirm)
+        reject = QPushButton("选中是误报 · 批量删除")
+        reject.setStyleSheet("font-weight:bold; color:#9a3b00;")
+        reject.clicked.connect(self.reject_selected)
+        buttons.addWidget(reject)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self):
+        self.items.clear()
+        for record in self.queue.list_items():
+            pixmap = QPixmap(record["image_path"])
+            icon = QIcon(pixmap.scaled(
+                self.items.iconSize(), Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            created = record["created_at"].replace("T", " ")[:19]
+            item = QListWidgetItem(icon, f"{created}\n相似度 {record['score']:.2f}")
+            item.setData(Qt.ItemDataRole.UserRole, record["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.items.addItem(item)
+
+    def checked_ids(self):
+        return [self.items.item(index).data(Qt.ItemDataRole.UserRole)
+                for index in range(self.items.count())
+                if self.items.item(index).checkState() == Qt.CheckState.Checked]
+
+    def select_all(self):
+        for index in range(self.items.count()):
+            self.items.item(index).setCheckState(Qt.CheckState.Checked)
+
+    def confirm_selected(self):
+        selected = self.checked_ids()
+        if not selected:
+            self.result_label.setText("请先勾选要确认的照片。")
+            return
+        result = self.queue.confirm_many(
+            selected, self.recognizer, max_learned=self.max_learned,
+            duplicate_threshold=self.duplicate_threshold)
+        message = (f"批量学习完成：新增 {result['learned']}，重复 {result['duplicate']}，"
+                   f"无法对齐 {result['invalid']}，失败 {result['error']}。")
+        self.result_label.setText(message)
+        self.message_ready.emit(f"[审核] {message}")
+        self.refresh()
+
+    def reject_selected(self):
+        selected = self.checked_ids()
+        if not selected:
+            self.result_label.setText("请先勾选要删除的误报照片。")
+            return
+        result = self.queue.reject_many(selected)
+        message = f"已删除 {result['deleted']} 条误报记录。"
+        self.result_label.setText(message)
+        self.message_ready.emit(f"[审核] {message}")
+        self.refresh()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, cfg, source=None, screenshot_path=None):
         super().__init__()
@@ -451,7 +549,22 @@ class MainWindow(QMainWindow):
         self.btn_review.setText(f"审核记录 ({count})")
 
     def open_review(self):
-        self.log_event("[审核] 批量审核界面正在加载")
+        if not self.review_queue.list_items():
+            self.log_event("[审核] 当前没有待审核记录")
+            return
+        try:
+            _, recognizer = core.build_models(self.cfg)
+        except Exception as e:
+            self.log_event(f"[审核错误] 模型加载失败: {e}")
+            return
+        dialog = ReviewDialog(
+            self.review_queue, recognizer,
+            max_learned=self.cfg.get("max_learned_photos", 30),
+            duplicate_threshold=self.cfg.get("learned_duplicate_threshold", 0.93),
+            parent=self)
+        dialog.message_ready.connect(self.log_event)
+        dialog.exec()
+        self.refresh_review_count()
 
     def log_event(self, text):
         from datetime import datetime

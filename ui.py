@@ -530,7 +530,7 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.btn_quit)
         side.addLayout(btns)
 
-        self.log_event("提示: 先在\"设置\"里选择护身窗口, 再启动巡逻")
+        self.log_event("提示: 可在\"设置\"里选择护身窗口；不选择则检测时显示桌面")
         if not cfg.get("guard_window_keyword"):
             self.log_event("⚠ 当前未配置护身窗口: 检测到老曹将自动显示桌面")
             self.log_event("  (也可在设置→护身窗口中选择打开着的课件/文档)")

@@ -16,6 +16,7 @@
   "alert_threshold": 0.35,
   "id_threshold": 0.5,
   "confirm_frames": 3,
+  "recognition_cache_frames": 5,
   "cooldown_seconds": 25,
   "review_rearm_seconds": 1.0,
   "beep_alert": true,

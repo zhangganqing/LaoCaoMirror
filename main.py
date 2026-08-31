@@ -29,7 +29,7 @@ if getattr(sys, "frozen", False):
         sys.stderr = open(os.devnull, "w")
     os.chdir(os.path.dirname(sys.executable))
 
-# 必须在 numpy/cv2/torch 之前设置: 小推理下的线程自旋空转是 CPU 占用的最大来源
+# 必须在 numpy/cv2/onnxruntime 之前设置，限制小模型推理的线程自旋。
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 
@@ -37,10 +37,6 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import winsound
-import torch
-from ultralytics import YOLO
-
-torch.set_num_threads(2)   # 不限制时 torch 会把全部核心拉去并行小推理, 风扇狂转
 
 # ---------------- 配置 ----------------
 DEFAULTS = {
@@ -61,6 +57,7 @@ DEFAULTS = {
     "alert_threshold": 0.35,  # 疑似老曹阈值: 超过则响提醒音(不切屏)
     "id_threshold": 0.5,      # 切屏阈值: 超过则确认是老曹, 立即切屏
     "confirm_frames": 2,      # 连续命中 N 帧才切屏
+    "recognition_cache_frames": 5,  # 普通低分脸最多复用几帧，之后重新识别
     "cooldown_seconds": 25,   # 老曹离开后保持防御的时长
     "review_rearm_seconds": 1.0,  # 连续未检出多久后，再出现时新建审核记录
     "beep_alert": True,       # 陌生人(认不出)提醒音
@@ -72,8 +69,87 @@ DEFAULTS = {
 }
 
 
+def requested_compute_backend():
+    """返回发行版指定的算力后端；脚本入口默认自动选择。"""
+    backend = os.environ.get("LCSB_COMPUTE_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "cpu", "gpu"}:
+        raise ValueError(
+            "LCSB_COMPUTE_BACKEND 只能是 auto、cpu 或 gpu，"
+            f"当前值为 {backend!r}")
+    return backend
+
+
+def resolve_compute_backend(requested=None, available_providers=None):
+    """解析 auto，并验证固定 GPU 版是否真的有 CUDA provider。"""
+    requested = (requested or requested_compute_backend()).lower()
+    available = set(available_providers or ort.get_available_providers())
+    if requested == "auto":
+        return "gpu" if "CUDAExecutionProvider" in available else "cpu"
+    if requested not in {"cpu", "gpu"}:
+        raise ValueError(f"不支持的算力后端: {requested}")
+    if requested == "gpu" and "CUDAExecutionProvider" not in available:
+        raise RuntimeError(
+            "GPU 版需要 CUDAExecutionProvider，但当前 ONNX Runtime 未提供。"
+            "请安装 NVIDIA 驱动、匹配版本的 CUDA/cuDNN 和 onnxruntime-gpu。")
+    return requested
+
+
+def execution_providers(backend, available_providers=None):
+    """固定发行版的 provider；GPU 版禁止静默退回 CPU。"""
+    resolved = resolve_compute_backend(backend, available_providers)
+    if resolved == "gpu":
+        return ["CUDAExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+def create_onnx_session(model_path, backend, session_options=None):
+    """用指定发行版后端创建 ONNX 会话。"""
+    resolved = resolve_compute_backend(backend)
+    if session_options is None:
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = 2
+        session_options.log_severity_level = 3
+    try:
+        session = ort.InferenceSession(
+            model_path, sess_options=session_options,
+            providers=execution_providers(resolved))
+    except Exception as exc:
+        if resolved == "gpu":
+            raise RuntimeError(
+                "CUDAExecutionProvider 加载失败。请检查 NVIDIA 驱动、CUDA、"
+                "cuDNN 与 onnxruntime-gpu 的版本是否匹配。") from exc
+        raise
+    if (resolved == "gpu"
+            and session.get_providers()[0] != "CUDAExecutionProvider"):
+        raise RuntimeError(
+            "CUDAExecutionProvider 加载失败，GPU 版拒绝静默退回 CPU。"
+            "请检查 NVIDIA 驱动、CUDA、cuDNN 与 onnxruntime-gpu。")
+    return session
+
+
+def model_cache_key(cfg, backend):
+    """同一路径的 CPU/GPU 模型不能共用进程内缓存。"""
+    return (cfg["models_dir"], cfg["gallery_dir"], backend)
+
+
+def model_runtime_report(detector, recognizer, distribution_label=None):
+    """生成可同时用于控制台和 GUI 的实际 provider 报告。"""
+    label = distribution_label or (
+        "GPU" if detector.provider == "CUDAExecutionProvider" else "CPU")
+    aligner_provider = getattr(recognizer.aligner, "provider", "未知")
+    return (f"[算力] {label}版 | 检测={detector.provider} | "
+            f"对齐={aligner_provider} | 识别={recognizer.provider}")
+
+
 def load_config(path="config.json"):
     cfg = dict(DEFAULTS)
+    if requested_compute_backend() == "cpu":
+        # 仅作为 CPU 发行版的新安装默认值；已有 config.json 会在下方覆盖。
+        cfg.update({
+            "camera_resolution": [1280, 720],
+            "fps": 8,
+            "detect_imgsz": 640,
+        })
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -99,28 +175,108 @@ def save_config(cfg, path="config.json"):
 ARC_DST = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
                     [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
 FACE_CACHE_VERSION = 3
+LEARNED_ANCHOR_MIN_SIMILARITY = 0.45
+LEARNED_CENTER_WEIGHT = 0.20
+
+
+def prepare_yolo_input(frame, input_size):
+    """按 YOLO letterbox 规则等比缩放，返回 NCHW RGB float32 输入与坐标元数据。"""
+    height, width = frame.shape[:2]
+    scale = min(input_size / width, input_size / height)
+    resized_w = max(1, round(width * scale))
+    resized_h = max(1, round(height * scale))
+    pad_x = (input_size - resized_w) // 2
+    pad_y = (input_size - resized_h) // 2
+    canvas = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    canvas[pad_y:pad_y + resized_h, pad_x:pad_x + resized_w] = cv2.resize(
+        frame, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+    blob = cv2.dnn.blobFromImage(
+        canvas, scalefactor=1.0 / 255.0, size=(input_size, input_size),
+        swapRB=True, crop=False)
+    return blob.astype(np.float32, copy=False), scale, (pad_x, pad_y)
+
+
+def _nms_face_boxes(boxes, scores, iou_threshold):
+    order = np.argsort(scores)[::-1]
+    kept = []
+    while order.size:
+        current = int(order[0])
+        kept.append(current)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        overlaps = np.array([
+            _iou(boxes[current], boxes[int(index)]) for index in rest
+        ], dtype=np.float32)
+        order = rest[overlaps < iou_threshold]
+    return kept
+
+
+def decode_yolo_face_output(output, frame_shape, scale, pad,
+                            confidence_threshold=0.25, iou_threshold=0.45):
+    """解析单类别 YOLOv8 ONNX 的 [1,5,N] 输出并还原原图坐标。"""
+    prediction = np.asarray(output)
+    if prediction.ndim == 3:
+        prediction = prediction[0]
+    if prediction.ndim != 2:
+        raise ValueError(f"无法识别的 YOLO 输出形状: {prediction.shape}")
+    if prediction.shape[0] == 5:
+        prediction = prediction.T
+    if prediction.shape[1] < 5:
+        raise ValueError(f"YOLO 输出缺少框或置信度: {prediction.shape}")
+
+    prediction = prediction[prediction[:, 4] >= confidence_threshold]
+    if prediction.size == 0:
+        return []
+    pad_x, pad_y = pad
+    frame_h, frame_w = frame_shape[:2]
+    decoded = []
+    scores = []
+    for center_x, center_y, width, height, confidence, *_ in prediction:
+        x1 = (center_x - width / 2 - pad_x) / scale
+        y1 = (center_y - height / 2 - pad_y) / scale
+        x2 = (center_x + width / 2 - pad_x) / scale
+        y2 = (center_y + height / 2 - pad_y) / scale
+        box = (
+            int(round(max(0, min(frame_w, x1)))),
+            int(round(max(0, min(frame_h, y1)))),
+            int(round(max(0, min(frame_w, x2)))),
+            int(round(max(0, min(frame_h, y2)))),
+        )
+        if box[2] > box[0] and box[3] > box[1]:
+            decoded.append(box)
+            scores.append(float(confidence))
+    if not decoded:
+        return []
+    return [decoded[index] for index in _nms_face_boxes(
+        decoded, scores, iou_threshold)]
 
 
 class FaceDetector:
-    def __init__(self, weights):
-        self.model = YOLO(weights)
-        self.device = "cpu"
+    def __init__(self, onnx_path, backend="cpu"):
+        self.sess = create_onnx_session(onnx_path, backend)
+        self.input_name = self.sess.get_inputs()[0].name
+        self.provider = self.sess.get_providers()[0]
 
     def detect(self, frame, imgsz=960):
         """返回 [(x1,y1,x2,y2), ...]"""
-        res = self.model(frame, verbose=False, imgsz=imgsz, device=self.device)[0]
-        return res.boxes.xyxy.cpu().numpy().astype(int)
+        blob, scale, pad = prepare_yolo_input(frame, imgsz)
+        output = self.sess.run(None, {self.input_name: blob})[0]
+        return decode_yolo_face_output(
+            output, frame.shape[:2], scale, pad,
+            confidence_threshold=0.25, iou_threshold=0.70)
 
 
 class FaceAligner:
     """SCRFD 检出五点关键点，并仿射对齐到 ArcFace 标准 112x112 人脸。"""
 
-    def __init__(self, onnx_path):
+    def __init__(self, onnx_path, backend="cpu"):
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2
         so.log_severity_level = 3  # 动态 320 输入与模型静态输出注记不一致的警告不影响结果
-        self.sess = ort.InferenceSession(onnx_path, so, providers=["CPUExecutionProvider"])
+        self.sess = create_onnx_session(onnx_path, backend, so)
         self.input_name = self.sess.get_inputs()[0].name
+        self.provider = self.sess.get_providers()[0]
         self._anchor_cache = {}
 
     def _anchors(self, input_size, stride):
@@ -171,11 +327,13 @@ class FaceAligner:
 
 
 class FaceRecognizer:
-    def __init__(self, onnx_path, gallery_dir, detector=None, aligner=None):
+    def __init__(self, onnx_path, gallery_dir, detector=None, aligner=None,
+                 backend="cpu"):
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2   # 112x112 小图, 2 线程足够
-        self.sess = ort.InferenceSession(onnx_path, so, providers=["CPUExecutionProvider"])
+        self.sess = create_onnx_session(onnx_path, backend, so)
         self.input_name = self.sess.get_inputs()[0].name
+        self.provider = self.sess.get_providers()[0]
         self.detector = detector   # 注册半身照时需先检测裁脸
         self.aligner = aligner
         self.gallery_dir = gallery_dir
@@ -250,12 +408,35 @@ class FaceRecognizer:
                 pass
 
     def _refresh_gallery_mean(self, name):
-        """用当前逐照片特征重算身份中心；确认学习后无需重启即可生效。"""
-        vectors = list(self.gallery_embeddings.get(name, {}).values())
-        if not vectors:
+        """以原始照片为锚点生成稳健中心，限制模糊新增样本造成的漂移。"""
+        samples = self.gallery_embeddings.get(name, {})
+        if not samples:
             self.gallery.pop(name, None)
             return
-        mean = np.mean(vectors, axis=0).astype(np.float32)
+
+        def normalized_mean(vectors):
+            mean = np.mean(vectors, axis=0).astype(np.float32)
+            norm = float(np.linalg.norm(mean))
+            return mean / norm if norm > 0 else mean
+
+        references = [vector for filename, vector in samples.items()
+                      if not filename.startswith("learned_")]
+        learned = [vector for filename, vector in samples.items()
+                   if filename.startswith("learned_")]
+        if references:
+            reference_center = normalized_mean(references)
+            consistent = [vector for vector in learned
+                          if float(reference_center @ vector)
+                          >= LEARNED_ANCHOR_MIN_SIMILARITY]
+            if consistent:
+                adaptive_center = normalized_mean(consistent)
+                mean = ((1.0 - LEARNED_CENTER_WEIGHT) * reference_center
+                        + LEARNED_CENTER_WEIGHT * adaptive_center)
+            else:
+                mean = reference_center
+        else:
+            # 兼容没有手工原始照片的自建图库。
+            mean = normalized_mean(list(samples.values()))
         norm = float(np.linalg.norm(mean))
         if norm > 0:
             self.gallery[name] = mean / norm
@@ -583,6 +764,45 @@ def _iou(a, b):
     return inter / ua if ua > 0 else 0.0
 
 
+def merge_fragmented_face_boxes(boxes):
+    """合并同一头部的重叠框及紧邻的小碎片框，保留相邻的独立人脸。"""
+    pending = [tuple(map(int, box)) for box in boxes]
+    merged = []
+    while pending:
+        current = pending.pop(0)
+        changed = True
+        while changed:
+            changed = False
+            for index, other in enumerate(pending):
+                cw, ch = current[2] - current[0], current[3] - current[1]
+                ow, oh = other[2] - other[0], other[3] - other[1]
+                current_area = max(cw, 0) * max(ch, 0)
+                other_area = max(ow, 0) * max(oh, 0)
+                smaller = min(current_area, other_area)
+                larger = max(current_area, other_area)
+
+                horizontal_gap = max(
+                    0, max(current[0], other[0]) - min(current[2], other[2]))
+                vertical_overlap = max(
+                    0, min(current[3], other[3]) - max(current[1], other[1]))
+                min_height = max(min(ch, oh), 1)
+                adjacent_fragment = (
+                    larger > 0
+                    and smaller / larger <= 0.60
+                    and horizontal_gap <= 0.12 * max(cw, ow)
+                    and vertical_overlap / min_height >= 0.65
+                )
+                if _iou(current, other) >= 0.35 or adjacent_fragment:
+                    current = (
+                        min(current[0], other[0]), min(current[1], other[1]),
+                        max(current[2], other[2]), max(current[3], other[3]))
+                    pending.pop(index)
+                    changed = True
+                    break
+        merged.append(current)
+    return merged
+
+
 def expand_face_box(box, frame_shape, ratio=0.25):
     """给紧贴人脸的检测框补少量上下文，供 SCRFD 稳定定位五点关键点。"""
     x1, y1, x2, y2 = box
@@ -636,24 +856,24 @@ def detect_faces(detector, frame, rois, imgsz=960):
                        for rx1, ry1, rx2, ry2 in pixel_rois):
                 continue
         boxes.append(box)
-    return boxes
+    return merge_fragmented_face_boxes(boxes)
 
 
 def build_models(cfg):
-    """模型进程内缓存: 引擎重启(换摄像头等)时免重复加载; 有 NVIDIA 显卡自动用 GPU"""
-    key = (cfg["models_dir"], cfg["gallery_dir"])
+    """模型进程内缓存；CPU/GPU 发行版使用互相隔离的模型实例。"""
+    backend = resolve_compute_backend()
+    key = model_cache_key(cfg, backend)
     if key not in _model_cache:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        detector = FaceDetector(os.path.join(cfg["models_dir"], "yolov8n-face.pt"))
-        detector.device = device
-        aligner = FaceAligner(os.path.join(cfg["models_dir"], "scrfd_2.5g.onnx"))
+        detector = FaceDetector(
+            os.path.join(cfg["models_dir"], "yolov8n-face.onnx"), backend=backend)
+        aligner = FaceAligner(
+            os.path.join(cfg["models_dir"], "scrfd_2.5g.onnx"), backend=backend)
         recognizer = FaceRecognizer(os.path.join(cfg["models_dir"], "w600k_mbf.onnx"),
-                                    cfg["gallery_dir"], detector=detector, aligner=aligner)
+                                    cfg["gallery_dir"], detector=detector,
+                                    aligner=aligner, backend=backend)
         _model_cache[key] = (detector, recognizer)
-        if device != "cpu":
-            print(f"[算力] 推理设备: GPU ({torch.cuda.get_device_name(0)})")
-        else:
-            print("[算力] 推理设备: CPU (无可用 NVIDIA 显卡)")
+        label = "GPU" if backend == "gpu" else "CPU"
+        print(model_runtime_report(detector, recognizer, label))
     return _model_cache[key]
 
 
@@ -721,7 +941,8 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
     guard_cur = guard_hwnd
     keyword_cur = cfg.get("guard_window_keyword") or ""
     last_guard_check = 0.0
-    prev_faces = []   # 上一帧脸的身份缓存 [(x1,y1,x2,y2,name,score)]: IoU 匹配沿用, 免重复识别
+    # 上一帧脸缓存 [(x1,y1,x2,y2,name,score,cache_age)]；低分脸定期刷新，疑似脸逐帧刷新。
+    prev_faces = []
     cur_faces = []
     review_queue = ReviewQueue(cfg["gallery_dir"])
     review_record_id = None
@@ -802,6 +1023,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
         for x1, y1, x2, y2 in boxes:
             ratio = (y2 - y1) / h_frame
             name, score = None, -1.0
+            cache_age = 0
             face_crop = None
             if x2 - x1 > 8 and y2 - y1 > 8:
                 # 紧框适合 YOLO，但五点对齐和待确认照片需要少量额头/下巴上下文。
@@ -810,11 +1032,21 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                 # 检测框和缓存框均为全画面坐标，所有 ROI 都能正确复用身份。
                 for pf in prev_faces:
                     if _iou((x1, y1, x2, y2), pf[:4]) > 0.4:
-                        name, score = pf[4], pf[5]
+                        # 低分普通人复用缓存省 CPU；疑似及高分目标必须逐帧重识别，
+                        # 否则一次糊帧误判会被缓存伪造成连续多帧命中。
+                        next_age = (pf[6] if len(pf) > 6 else 0) + 1
+                        refresh_frames = max(
+                            int(cfg.get("recognition_cache_frames", 5)), 1)
+                        if (pf[5] < cfg.get("alert_threshold", 0.35)
+                                and next_age < refresh_frames):
+                            name, score = pf[4], pf[5]
+                            cache_age = next_age
                         break
                 if name is None:
                     name, score = recognizer.identify(face_crop)
-            hit = (score >= cfg["id_threshold"])
+                    cache_age = 0
+            hit = (score >= cfg["id_threshold"]
+                   and ratio >= cfg.get("min_face_ratio", 0.05))
             suspected = (not hit and score >= cfg.get("alert_threshold", 0.35))
             if hit:
                 laocao_here = True
@@ -837,7 +1069,7 @@ def run_loop(cfg, cap, detector, recognizer, guard_hwnd, cb,
                 color, label = (0, 200, 255), "???"
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            cur_faces.append((x1, y1, x2, y2, name, score))
+            cur_faces.append((x1, y1, x2, y2, name, score, cache_age))
         prev_faces = cur_faces
 
         # ---- 状态机 ----

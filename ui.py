@@ -6,6 +6,7 @@
 用法: python ui.py [--source 测试源]
 """
 import json
+import os
 import sys
 import threading
 
@@ -21,7 +22,8 @@ from PyQt6.QtWidgets import (
 
 import main as core
 
-WINDOW_TITLE = "防老曹后视镜"
+DISTRIBUTION_LABEL = os.environ.get("LCSB_DISTRIBUTION_LABEL", "自动")
+WINDOW_TITLE = f"防老曹后视镜 · {DISTRIBUTION_LABEL}版"
 
 
 def list_visible_windows():
@@ -69,6 +71,8 @@ class Engine(QThread):
             self.event_ready.emit(f"[错误] 模型加载失败: {e}")
             self.engine_stopped.emit()
             return
+        self.event_ready.emit(core.model_runtime_report(
+            detector, recognizer, DISTRIBUTION_LABEL))
         guard_hwnd = core.report_startup(self.cfg, recognizer)
         try:
             cap = core.open_source(self.source, self.cfg)

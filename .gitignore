@@ -9,6 +9,8 @@ build_log.txt
 # Python
 __pycache__/
 *.pyc
+.venv-cpu-build/
+.venv-gpu-build/
 
 # Mimosa 本地扫描数据
 .mimosa/

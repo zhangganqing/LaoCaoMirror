@@ -34,6 +34,34 @@ def _recognizer_without_models(gallery_dir, embeddings, candidate_embedding):
 
 
 class FaceGalleryLearningTests(unittest.TestCase):
+    def test_learned_outliers_cannot_drag_reliable_identity_center(self):
+        """大量模糊新增样本不能压过用户提供的可靠原始照片。"""
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            reference_a = np.array([1.0, 0.0], dtype=np.float32)
+            reference_b = np.array([0.98, 0.20], dtype=np.float32)
+            reference_b /= np.linalg.norm(reference_b)
+            good_learned = np.array([0.8, 0.6], dtype=np.float32)
+            embeddings = {
+                "manual_a.jpg": reference_a,
+                "manual_b.jpg": reference_b,
+                "learned_good.jpg": good_learned,
+            }
+            embeddings.update({
+                f"learned_outlier_{index}.jpg": np.array([0.0, 1.0], dtype=np.float32)
+                for index in range(8)
+            })
+            recognizer = _recognizer_without_models(
+                gallery_dir, embeddings, [1.0, 0.0])
+            reference_center = reference_a + reference_b
+            reference_center /= np.linalg.norm(reference_center)
+            active_center = recognizer.gallery[os.path.basename(gallery_dir)]
+
+            self.assertGreater(float(reference_center @ active_center), 0.97)
+            self.assertGreater(
+                float(good_learned @ active_center),
+                float(good_learned @ reference_center),
+                "一致的新增样本仍应产生受限的自适应效果")
+
     def test_confirm_promotes_photo_and_updates_gallery_without_restart(self):
         self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "图库热学习尚未实现")
         with tempfile.TemporaryDirectory() as gallery_dir:
@@ -51,7 +79,8 @@ class FaceGalleryLearningTests(unittest.TestCase):
             self.assertTrue(os.path.exists(result["path"]))
             name = os.path.basename(gallery_dir)
             self.assertIn(os.path.basename(result["path"]), recognizer.gallery_embeddings[name])
-            expected = np.array([0.9, 0.3], dtype=np.float32)
+            # 可靠原始照片占 80%，一致的新增样本最多影响 20%。
+            expected = np.array([0.96, 0.12], dtype=np.float32)
             expected /= np.linalg.norm(expected)
             np.testing.assert_allclose(recognizer.gallery[name], expected, atol=1e-6)
 
@@ -136,6 +165,11 @@ class _LoopDetector:
         return np.array([[25, 20, 75, 80]])
 
 
+class _SmallFaceDetector:
+    def detect(self, _frame, imgsz=960):
+        return np.array([[45, 45, 55, 55]])
+
+
 class _SequenceDetector:
     def __init__(self, detections):
         self.detections = iter(detections)
@@ -174,6 +208,15 @@ class _LoopRecognizer:
     def learn_face(self, _face, **_kwargs):
         self.learn_calls += 1
         return {"status": self.learning_status, "path": "learned_test.jpg"}
+
+
+class _SequenceRecognizer(_LoopRecognizer):
+    def __init__(self, scores):
+        super().__init__()
+        self.scores = iter(scores)
+
+    def identify(self, _face):
+        return "laocao", next(self.scores)
 
 
 class ReviewQueuePipelineTests(unittest.TestCase):
@@ -225,6 +268,49 @@ class ReviewQueuePipelineTests(unittest.TestCase):
             items = core.ReviewQueue(gallery_dir).list_items()
             self.assertEqual(len(items), 2)
             self.assertEqual(sum("[记录]" in event for event in cb.events), 2)
+
+    def test_small_high_score_face_cannot_trigger_defense(self):
+        """低于最小脸占比的模糊目标即使偶然高分也不能切屏。"""
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            cb = _FrameLimitCapture(2)
+            cfg = self._cfg(gallery_dir)
+            cfg["min_face_ratio"] = 0.20
+            with patch.object(core, "beep"), patch.object(core, "toggle_desktop"):
+                core.run_loop(
+                    cfg, _LoopCaptureSource(), _SmallFaceDetector(),
+                    _LoopRecognizer(), None, cb)
+
+            self.assertEqual(core.ReviewQueue(gallery_dir).list_items(), [])
+            self.assertFalse(any("[防御]" in event for event in cb.events))
+
+    def test_high_score_confirmation_uses_fresh_recognition_each_frame(self):
+        """一次偶然高分不能靠帧间缓存伪造连续命中。"""
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            cb = _FrameLimitCapture(2)
+            cfg = self._cfg(gallery_dir)
+            cfg["confirm_frames"] = 2
+            with patch.object(core, "beep"), patch.object(core, "toggle_desktop"):
+                core.run_loop(
+                    cfg, _LoopCaptureSource(), _LoopDetector(),
+                    _SequenceRecognizer([0.8, 0.1]), None, cb)
+
+            self.assertEqual(core.ReviewQueue(gallery_dir).list_items(), [])
+            self.assertFalse(any("[防御]" in event for event in cb.events))
+
+    def test_low_score_cache_expires_as_target_approaches(self):
+        """远处首帧低分不能永久缓存，走近后必须重新识别。"""
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            cb = _FrameLimitCapture(3)
+            cfg = self._cfg(gallery_dir)
+            cfg["confirm_frames"] = 2
+            cfg["recognition_cache_frames"] = 1
+            with patch.object(core, "beep"), patch.object(core, "toggle_desktop"):
+                core.run_loop(
+                    cfg, _LoopCaptureSource(), _LoopDetector(),
+                    _SequenceRecognizer([0.1, 0.8, 0.8]), None, cb)
+
+            self.assertEqual(len(core.ReviewQueue(gallery_dir).list_items()), 1)
+            self.assertTrue(any("[防御]" in event for event in cb.events))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ import time
 import psutil
 
 child_env = dict(os.environ)
-child_env["CUDA_VISIBLE_DEVICES"] = "-1"  # 有独显的开发机也必须测到朋友电脑的 CPU 路径
+child_env["LCSB_COMPUTE_BACKEND"] = "cpu"  # 有独显的开发机也必须测到朋友电脑的 CPU 发行版
+child_env["LCSB_DISTRIBUTION_LABEL"] = "CPU"
 p = subprocess.Popen(
     [sys.executable, "-u", "main.py", "--source", "test_face.jpg", "--max-seconds", "15"],
     stdout=sys.stdout, stderr=sys.stderr, env=child_env)

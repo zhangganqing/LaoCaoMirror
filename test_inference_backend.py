@@ -84,6 +84,37 @@ class InferenceBackendTests(unittest.TestCase):
 
         preload.assert_called_once_with()
 
+    def test_gpu_session_registers_pip_nvidia_bin_before_preload(self):
+        cuda_session = type("Session", (), {
+            "get_providers": lambda self: ["CUDAExecutionProvider"]})()
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cudnn_bin = Path(temp_dir) / "nvidia" / "cudnn" / "bin"
+            cudnn_bin.mkdir(parents=True)
+            with (patch.object(core.sys, "path", [temp_dir]),
+                  patch.dict(core.os.environ, {"PATH": "existing"}),
+                  patch.object(
+                      core.os, "add_dll_directory",
+                      side_effect=lambda path: events.append(
+                          ("register", path)) or object()),
+                  patch.object(
+                      core.ort, "get_available_providers",
+                      return_value=[
+                          "CUDAExecutionProvider", "CPUExecutionProvider"]),
+                  patch.object(
+                      core.ort, "preload_dlls",
+                      side_effect=lambda: events.append(("preload", None))),
+                  patch.object(
+                      core.ort, "InferenceSession",
+                      return_value=cuda_session)):
+                core.create_onnx_session("model.onnx", "gpu")
+                configured_path = os.environ["PATH"]
+
+            self.assertEqual(events[0], ("register", str(cudnn_bin)))
+            self.assertEqual(events[-1], ("preload", None))
+            self.assertTrue(
+                configured_path.startswith(f"{cudnn_bin}{os.pathsep}"))
+
     def test_model_cache_key_includes_resolved_backend(self):
         cpu_key = core.model_cache_key(
             {"models_dir": "models", "gallery_dir": "laocao"}, "cpu")

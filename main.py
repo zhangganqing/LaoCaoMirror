@@ -130,11 +130,51 @@ def gpu_setup_message(detail=None, guide_path=None):
     return "\n".join(lines)
 
 
+_gpu_dll_directory_handles = {}
+
+
+def register_pip_nvidia_dll_directories():
+    """让 Windows 能找到 NVIDIA pip 包内由 cuDNN 动态加载的子 DLL。"""
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return []
+
+    discovered = []
+    for entry in sys.path:
+        root = Path(entry or os.getcwd()) / "nvidia"
+        if not root.is_dir():
+            continue
+        for bin_dir in sorted(root.glob("*/bin")):
+            if bin_dir.is_dir():
+                path = str(bin_dir.resolve())
+                if path not in discovered:
+                    discovered.append(path)
+
+    current_path = os.environ.get("PATH", "")
+    current_entries = {
+        os.path.normcase(os.path.normpath(item))
+        for item in current_path.split(os.pathsep) if item
+    }
+    missing_from_path = [
+        path for path in discovered
+        if os.path.normcase(os.path.normpath(path)) not in current_entries
+    ]
+    if missing_from_path:
+        prefix = os.pathsep.join(missing_from_path)
+        os.environ["PATH"] = (
+            f"{prefix}{os.pathsep}{current_path}" if current_path else prefix)
+
+    for path in discovered:
+        if path not in _gpu_dll_directory_handles:
+            _gpu_dll_directory_handles[path] = os.add_dll_directory(path)
+    return discovered
+
+
 def create_onnx_session(model_path, backend, session_options=None):
     """用指定发行版后端创建 ONNX 会话。"""
     resolved = resolve_compute_backend(backend)
     if resolved == "gpu" and hasattr(ort, "preload_dlls"):
         try:
+            register_pip_nvidia_dll_directories()
             # ORT 1.21+ 会依次查找 PyTorch、NVIDIA pip 包和系统 CUDA/cuDNN。
             ort.preload_dlls()
         except Exception as exc:

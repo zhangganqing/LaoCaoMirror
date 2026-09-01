@@ -105,7 +105,7 @@ python -m venv .venv-gpu
 onnxruntime-gpu[cuda,cudnn]==1.26.0
 ```
 
-程序启动时会预加载这些 pip 安装的 NVIDIA DLL。不要在同一虚拟环境同时安装 `onnxruntime` 和 `onnxruntime-gpu`。
+程序启动时会自动注册各 NVIDIA pip 包的 `bin` 目录，并预加载其中的 DLL，包括 cuDNN 9.25 的拆分子库。不要在同一虚拟环境同时安装 `onnxruntime` 和 `onnxruntime-gpu`。
 首次安装会下载数百 MB 到数 GB 的 NVIDIA 运行库，耗时取决于网络速度，请等待命令完整结束。
 
 ## 仍然失败时怎么检查

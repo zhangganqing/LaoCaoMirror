@@ -110,6 +110,10 @@ Ultralytics。`python test_resource.py` 会强制走 CPU 路径，避免开发�
 
 ## CPU / GPU 依赖与构建
 
+第一次使用 GPU 版请先阅读 **[GPU 安装教程](GPU安装教程.md)**。教程解释了为什么
+“能看到 NVIDIA 显卡/PyTorch 能用 CUDA”仍可能缺少 ONNX Runtime 所需的 DLL，
+并分别提供打包版和源码版的完整安装、PATH 配置及验证命令。
+
 两个版本必须使用不同虚拟环境，因为 `onnxruntime` 与 `onnxruntime-gpu` 不能混装：
 
 ```powershell
@@ -123,7 +127,7 @@ GPU 版用户需自行安装匹配的 NVIDIA 驱动、CUDA 12.x、cuDNN 9.x 和�
 
 ```powershell
 python -m pip install -r requirements-cpu.txt
-python -m pip install -r requirements-gpu.txt
+python -m pip install -r requirements-gpu-source.txt   # 源码 GPU 版，自动安装 CUDA/cuDNN DLL
 ```
 
 运行时不需要 `models/yolov8n-face.pt`；该文件仅保留用于重新导出或对照验证。
@@ -155,7 +159,7 @@ python test_resource.py                                       # 资源占用实�
 - 2026-08-31 v0.4：检测记录改为跨重启批量审核队列；恢复与真假判断解耦；无护身窗口时 Win+D；新增对焦、曝光、逆光补偿和检测阴影增强 ✔
 - 2026-08-31 v0.4.1：摄像头变更改为异步停止并串行重启，修复设置保存时界面假死、双线程争抢摄像头及旧线程信号误清新线程，30 项自动测试通过 ✔
 - 2026-08-31 v0.4.2：审核事件按“离开后再次出现”自动重新分段，不再依赖手动恢复，31 项自动测试通过 ✔
-- 2026-08-31 双版本开发：YOLO 转为动态 FP32 ONNX；CPU/GPU 三模型统一 provider；新增固定入口、互斥依赖、独立构建配置和 CUDA 防伪回退；54 项自动测试、ROI 与 CPU 资源实测通过 ✔
+- 2026-09-01 双版本开发：YOLO 转为动态 FP32 ONNX；CPU/GPU 三模型统一 provider；新增固定入口、互斥依赖、独立构建配置、CUDA 防伪回退及 GPU 安装诊断/教程；61 项自动测试、ROI 与 CPU 资源实测通过 ✔
 
 ## 已知限制(v0.5 计划)
 

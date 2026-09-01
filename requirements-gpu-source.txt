@@ -1,0 +1,2 @@
+-r requirements-common.txt
+onnxruntime-gpu[cuda,cudnn]==1.26.0

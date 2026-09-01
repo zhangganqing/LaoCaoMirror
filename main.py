@@ -88,9 +88,8 @@ def resolve_compute_backend(requested=None, available_providers=None):
     if requested not in {"cpu", "gpu"}:
         raise ValueError(f"不支持的算力后端: {requested}")
     if requested == "gpu" and "CUDAExecutionProvider" not in available:
-        raise RuntimeError(
-            "GPU 版需要 CUDAExecutionProvider，但当前 ONNX Runtime 未提供。"
-            "请安装 NVIDIA 驱动、匹配版本的 CUDA/cuDNN 和 onnxruntime-gpu。")
+        raise RuntimeError(gpu_setup_message(
+            "GPU 版需要 CUDAExecutionProvider，但当前 ONNX Runtime 未提供。"))
     return requested
 
 
@@ -102,9 +101,45 @@ def execution_providers(backend, available_providers=None):
     return ["CPUExecutionProvider"]
 
 
+def gpu_setup_guide_path():
+    """返回脚本或打包程序旁边的 GPU 中文安装教程。"""
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return str(base_dir / "GPU安装教程.md")
+
+
+def gpu_setup_message(detail=None, guide_path=None):
+    """生成普通用户可以照着处理的 GPU 环境诊断。"""
+    guide = guide_path or gpu_setup_guide_path()
+    lines = [
+        "GPU 环境未安装完整，程序没有使用显卡。",
+    ]
+    if detail:
+        lines.append(f"原因：{detail}")
+    lines.extend([
+        "需要：NVIDIA 驱动、CUDA 12.x、cuDNN 9.x、Microsoft Visual C++ 运行库，",
+        "以及 Python 模式下的 onnxruntime-gpu（不能与 onnxruntime 混装）。",
+        f"完整安装教程：{guide}",
+        "安装后重启电脑，再在 PowerShell 检查：",
+        "  nvidia-smi",
+        "  where.exe cublasLt64_12.dll",
+        "  where.exe cudnn64_9.dll",
+    ])
+    return "\n".join(lines)
+
+
 def create_onnx_session(model_path, backend, session_options=None):
     """用指定发行版后端创建 ONNX 会话。"""
     resolved = resolve_compute_backend(backend)
+    if resolved == "gpu" and hasattr(ort, "preload_dlls"):
+        try:
+            # ORT 1.21+ 会依次查找 PyTorch、NVIDIA pip 包和系统 CUDA/cuDNN。
+            ort.preload_dlls()
+        except Exception as exc:
+            raise RuntimeError(gpu_setup_message(
+                f"CUDA/cuDNN DLL 预加载失败：{exc}")) from exc
     if session_options is None:
         session_options = ort.SessionOptions()
         session_options.intra_op_num_threads = 2
@@ -115,15 +150,13 @@ def create_onnx_session(model_path, backend, session_options=None):
             providers=execution_providers(resolved))
     except Exception as exc:
         if resolved == "gpu":
-            raise RuntimeError(
-                "CUDAExecutionProvider 加载失败。请检查 NVIDIA 驱动、CUDA、"
-                "cuDNN 与 onnxruntime-gpu 的版本是否匹配。") from exc
+            raise RuntimeError(gpu_setup_message(
+                f"CUDAExecutionProvider 加载失败：{exc}")) from exc
         raise
     if (resolved == "gpu"
             and session.get_providers()[0] != "CUDAExecutionProvider"):
-        raise RuntimeError(
-            "CUDAExecutionProvider 加载失败，GPU 版拒绝静默退回 CPU。"
-            "请检查 NVIDIA 驱动、CUDA、cuDNN 与 onnxruntime-gpu。")
+        raise RuntimeError(gpu_setup_message(
+            "CUDAExecutionProvider 加载失败，GPU 版拒绝静默退回 CPU。"))
     return session
 
 

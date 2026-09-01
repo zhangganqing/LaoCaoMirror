@@ -6,6 +6,7 @@ datas = [
     ('models/scrfd_2.5g.onnx', 'models'),
     ('models/w600k_mbf.onnx', 'models'),
     ('config.example.json', '.'),
+    ('GPU安装教程.md', '.'),
     ('laocao/README.md', 'laocao'),
     ('laocao/0f18b067c807a1bbbcdb0e2450cfd880.jpg', 'laocao'),
     ('laocao/30f42f7cccac4f2003a1071e198de4da.jpg', 'laocao'),
@@ -66,4 +67,3 @@ coll = COLLECT(
     upx_exclude=[],
     name='LaoCaoMirror-GPU',
 )
-

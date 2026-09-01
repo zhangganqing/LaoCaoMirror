@@ -16,7 +16,8 @@ from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget,
-    QListView, QListWidgetItem, QMainWindow, QPushButton, QRubberBand, QSpinBox,
+    QListView, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QRubberBand, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
@@ -50,6 +51,7 @@ class Engine(QThread):
     frame_ready = pyqtSignal(object)
     state_ready = pyqtSignal(str)
     event_ready = pyqtSignal(str)
+    gpu_setup_required = pyqtSignal(str)
     engine_stopped = pyqtSignal()
 
     def __init__(self, cfg, source=None):
@@ -68,7 +70,10 @@ class Engine(QThread):
         try:
             detector, recognizer = core.build_models(self.cfg)
         except Exception as e:
-            self.event_ready.emit(f"[错误] 模型加载失败: {e}")
+            message = str(e)
+            self.event_ready.emit(f"[错误] 模型加载失败: {message}")
+            if core.requested_compute_backend() == "gpu":
+                self.gpu_setup_required.emit(message)
             self.engine_stopped.emit()
             return
         self.event_ready.emit(core.model_runtime_report(
@@ -532,6 +537,11 @@ class MainWindow(QMainWindow):
         self.btn_set = QPushButton("设置")
         self.btn_set.clicked.connect(self.open_settings)
         btns.addWidget(self.btn_set)
+        self.btn_gpu_help = None
+        if DISTRIBUTION_LABEL == "GPU":
+            self.btn_gpu_help = QPushButton("GPU 安装帮助")
+            self.btn_gpu_help.clicked.connect(self.open_gpu_setup_guide)
+            btns.addWidget(self.btn_gpu_help)
         self.btn_quit = QPushButton("退出")
         self.btn_quit.clicked.connect(self.close)
         btns.addWidget(self.btn_quit)
@@ -561,6 +571,7 @@ class MainWindow(QMainWindow):
         engine.frame_ready.connect(self.show_frame)
         engine.state_ready.connect(self.show_state)
         engine.event_ready.connect(self.log_event)
+        engine.gpu_setup_required.connect(self.show_gpu_setup_help)
         # 使用 QThread.finished：它只在线程 run() 真正返回后触发。捕获具体实例，
         # 避免旧线程的迟到信号误清除刚启动的新线程。
         engine.finished.connect(lambda engine=engine: self.on_engine_finished(engine))
@@ -623,6 +634,31 @@ class MainWindow(QMainWindow):
         if self.engine:
             self.engine.confirm_restore()
             self.btn_restore.setEnabled(False)
+
+    def open_gpu_setup_guide(self):
+        path = core.gpu_setup_guide_path()
+        if not os.path.isfile(path):
+            self.log_event(f"[GPU帮助] 找不到安装教程: {path}")
+            return
+        try:
+            os.startfile(path)
+        except OSError as error:
+            self.log_event(f"[GPU帮助] 无法打开教程: {path} ({error})")
+
+    def show_gpu_setup_help(self, detail):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("GPU 环境未安装完整")
+        box.setText("GPU 版无法启动：当前没有成功加载 CUDA。")
+        box.setInformativeText(
+            "请安装 NVIDIA 驱动、CUDA 12.x、cuDNN 9.x 和 Visual C++ 运行库。\n"
+            "点击“打开安装教程”查看从零安装步骤。")
+        box.setDetailedText(detail)
+        open_button = box.addButton("打开安装教程", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            self.open_gpu_setup_guide()
 
     def refresh_review_count(self):
         count = len(self.review_queue.list_items())

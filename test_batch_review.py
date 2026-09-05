@@ -12,9 +12,12 @@ class _ResultRecognizer:
     def learn_face(self, image, **_kwargs):
         value = int(round(float(image.mean()) / 10.0) * 10)
         if value == 10:
-            return {"status": "learned", "path": "learned_test.jpg"}
+            return {"status": "learned", "path": "learned_test.jpg",
+                    "archived": ["archive/old.jpg"]}
         if value == 20:
             return {"status": "duplicate", "similarity": 0.96}
+        if value == 40:
+            return {"status": "archived", "path": "archive/new.jpg"}
         return {"status": "invalid", "message": "五点对齐失败"}
 
 
@@ -34,12 +37,15 @@ class BatchReviewTests(unittest.TestCase):
         learned_id = self._add(10)
         duplicate_id = self._add(20)
         invalid_id = self._add(30)
+        archived_id = self._add(40)
 
         result = self.queue.confirm_many(
-            [learned_id, duplicate_id, invalid_id], _ResultRecognizer(),
+            [learned_id, duplicate_id, invalid_id, archived_id], _ResultRecognizer(),
             max_learned=30, duplicate_threshold=0.93)
 
         self.assertEqual(result["learned"], 1)
+        self.assertEqual(result["archived"], 1)
+        self.assertEqual(result["retired"], 1)
         self.assertEqual(result["duplicate"], 1)
         self.assertEqual(result["invalid"], 1)
         self.assertEqual(result["error"], 0)

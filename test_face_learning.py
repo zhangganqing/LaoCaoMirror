@@ -18,6 +18,13 @@ def _write_image(path, value):
     assert cv2.imwrite(path, image)
 
 
+def _write_checkerboard(path, low=40, high=220):
+    pattern = (np.indices((32, 32)).sum(axis=0) % 2).astype(np.uint8)
+    image = np.repeat(
+        np.where(pattern[..., None] == 0, low, high), 3, axis=2).astype(np.uint8)
+    assert cv2.imwrite(path, image)
+
+
 def _recognizer_without_models(gallery_dir, embeddings, candidate_embedding):
     recognizer = core.FaceRecognizer.__new__(core.FaceRecognizer)
     recognizer.gallery_dir = gallery_dir
@@ -99,34 +106,77 @@ class FaceGalleryLearningTests(unittest.TestCase):
             self.assertEqual(
                 [name for name in os.listdir(gallery_dir) if name.startswith("learned_")], [])
 
-    def test_cap_removes_only_oldest_auto_learned_photo(self):
-        self.assertTrue(hasattr(core.FaceRecognizer, "learn_face"), "自动样本上限尚未实现")
+    def test_cap_archives_lowest_quality_and_keeps_old_high_quality_photo(self):
         with tempfile.TemporaryDirectory() as gallery_dir:
             paths = {
                 "manual.jpg": os.path.join(gallery_dir, "manual.jpg"),
-                "learned_old.jpg": os.path.join(gallery_dir, "learned_old.jpg"),
-                "learned_newer.jpg": os.path.join(gallery_dir, "learned_newer.jpg"),
+                "learned_20260901_080000_000.jpg": os.path.join(
+                    gallery_dir, "learned_20260901_080000_000.jpg"),
+                "learned_20260904_080000_000.jpg": os.path.join(
+                    gallery_dir, "learned_20260904_080000_000.jpg"),
             }
-            for i, path in enumerate(paths.values()):
-                _write_image(path, 40 + i * 20)
-            os.utime(paths["learned_old.jpg"], (10, 10))
-            os.utime(paths["learned_newer.jpg"], (20, 20))
+            _write_image(paths["manual.jpg"], 100)
+            _write_checkerboard(paths["learned_20260901_080000_000.jpg"])
+            _write_image(paths["learned_20260904_080000_000.jpg"], 127)
+            os.utime(paths["learned_20260901_080000_000.jpg"], (10, 10))
+            os.utime(paths["learned_20260904_080000_000.jpg"], (20, 20))
             recognizer = _recognizer_without_models(
                 gallery_dir,
-                {"manual.jpg": [1.0, 0.0], "learned_old.jpg": [0.9, 0.1],
-                 "learned_newer.jpg": [0.8, 0.2]},
-                [0.0, 1.0])
+                {"manual.jpg": [1.0, 0.0],
+                 "learned_20260901_080000_000.jpg": [0.98, 0.20],
+                 "learned_20260904_080000_000.jpg": [0.30, 0.954]},
+                [0.90, 0.436])
 
             result = recognizer.learn_face(
-                np.full((32, 32, 3), 200, dtype=np.uint8),
+                np.repeat(
+                    np.where((np.indices((32, 32)).sum(axis=0) % 2)[..., None] == 0,
+                             50, 210), 3, axis=2).astype(np.uint8),
                 max_learned=2, duplicate_threshold=0.999,
-                now=datetime(2026, 8, 30, 19, 2, 3))
+                now=datetime(2026, 9, 5, 9, 30, 0))
 
             self.assertEqual(result["status"], "learned")
             self.assertTrue(os.path.exists(paths["manual.jpg"]))
-            self.assertFalse(os.path.exists(paths["learned_old.jpg"]))
+            self.assertTrue(os.path.exists(
+                paths["learned_20260901_080000_000.jpg"]))
+            self.assertFalse(os.path.exists(
+                paths["learned_20260904_080000_000.jpg"]))
+            archived = os.path.join(
+                gallery_dir, "archive", "2026-09-04",
+                "learned_20260904_080000_000.jpg")
+            self.assertTrue(os.path.exists(archived))
+            self.assertIn(archived, result["archived"])
             learned = [name for name in os.listdir(gallery_dir) if name.startswith("learned_")]
             self.assertEqual(len(learned), 2)
+
+    def test_new_low_quality_photo_is_archived_without_polluting_active_gallery(self):
+        with tempfile.TemporaryDirectory() as gallery_dir:
+            filenames = [
+                "learned_20260903_080000_000.jpg",
+                "learned_20260904_080000_000.jpg",
+            ]
+            _write_image(os.path.join(gallery_dir, "manual.jpg"), 100)
+            for filename in filenames:
+                _write_checkerboard(os.path.join(gallery_dir, filename))
+            recognizer = _recognizer_without_models(
+                gallery_dir,
+                {"manual.jpg": [1.0, 0.0],
+                 filenames[0]: [0.99, 0.141],
+                 filenames[1]: [0.95, 0.312]},
+                [0.0, 1.0])
+
+            result = recognizer.learn_face(
+                np.full((32, 32, 3), 127, dtype=np.uint8),
+                max_learned=2, duplicate_threshold=0.999,
+                now=datetime(2026, 9, 5, 10, 0, 0))
+
+            self.assertEqual(result["status"], "archived")
+            self.assertEqual(
+                sorted(name for name in os.listdir(gallery_dir)
+                       if name.startswith("learned_")), sorted(filenames))
+            archived = os.path.join(
+                gallery_dir, "archive", "2026-09-05",
+                "learned_20260905_100000_000.jpg")
+            self.assertTrue(os.path.exists(archived))
 
 
 class _LoopCapture:

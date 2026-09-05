@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -534,11 +535,83 @@ class FaceRecognizer:
                        "mean": self.gallery.get(name, np.array([])).tolist()},
                       f, ensure_ascii=False)
 
+    @staticmethod
+    def _visual_quality(face_img):
+        """返回 0~1 的清晰度和曝光分，供自动样本淘汰排序。"""
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        sharpness = min(np.log1p(variance) / np.log1p(1000.0), 1.0)
+        mean = float(gray.mean())
+        centered = max(0.0, 1.0 - abs(mean - 127.5) / 127.5)
+        clipped = float(np.mean((gray <= 5) | (gray >= 250)))
+        exposure = centered * (1.0 - clipped)
+        return sharpness, exposure
+
+    def _quality_anchor(self, name):
+        samples = self.gallery_embeddings.get(name, {})
+        references = [
+            np.asarray(vector, dtype=np.float32)
+            for filename, vector in samples.items()
+            if not filename.startswith("learned_")
+        ]
+        vectors = references or [
+            np.asarray(vector, dtype=np.float32)
+            for vector in samples.values()
+        ]
+        normalized = []
+        for vector in vectors:
+            norm = float(np.linalg.norm(vector))
+            if norm > 0:
+                normalized.append(vector / norm)
+        if not normalized:
+            return None
+        center = np.mean(normalized, axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(center))
+        return center / norm if norm > 0 else None
+
+    def _learned_quality(self, name, filename, anchor):
+        path = os.path.join(self.gallery_dir, filename)
+        image = cv2.imread(path)
+        if image is None or image.size == 0:
+            return -1.0
+        vector = np.asarray(
+            self.gallery_embeddings[name][filename], dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        identity = 0.0
+        if anchor is not None and norm > 0:
+            cosine = float(anchor @ (vector / norm))
+            identity = float(np.clip((cosine + 1.0) / 2.0, 0.0, 1.0))
+        sharpness, exposure = self._visual_quality(image)
+        return 0.70 * identity + 0.20 * sharpness + 0.10 * exposure
+
+    def _archive_learned_photo(self, filename):
+        source = Path(self.gallery_dir) / filename
+        if not source.is_file():
+            return None
+        parts = filename.split("_")
+        date_token = parts[1] if len(parts) > 1 else ""
+        if len(date_token) == 8 and date_token.isdigit():
+            date_dir = f"{date_token[:4]}-{date_token[4:6]}-{date_token[6:8]}"
+        else:
+            date_dir = datetime.fromtimestamp(source.stat().st_mtime).strftime("%Y-%m-%d")
+        archive_dir = Path(self.gallery_dir) / "archive" / date_dir
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        destination = archive_dir / filename
+        suffix = 1
+        while destination.exists():
+            destination = archive_dir / f"{source.stem}_{suffix}{source.suffix}"
+            suffix += 1
+        try:
+            shutil.move(str(source), str(destination))
+        except OSError:
+            return None
+        return str(destination)
+
     def learn_face(self, face_img, max_learned=30, duplicate_threshold=0.93, now=None):
         """人工确认后把脸照加入图库，并立即更新内存特征。
 
-        learned_ 前缀专门标记自动样本；达到上限时只删除其中最旧的，
-        用户手工放入图库的照片永远不会被这里清理。
+        learned_ 前缀专门标记自动样本；达到上限时按身份一致性、清晰度、
+        曝光综合评分，低质量样本移入 archive，手工照片永远不会被清理。
         """
         if face_img is None or face_img.size == 0:
             return {"status": "invalid", "message": "待学习照片为空"}
@@ -574,23 +647,29 @@ class FaceRecognizer:
 
         samples[filename] = embedding
         learned = [fn for fn in samples if fn.startswith("learned_")]
-        learned.sort(key=lambda fn: (os.path.getmtime(os.path.join(self.gallery_dir, fn)), fn))
-        removed = []
+        archived = []
+        candidate_active = True
         while len(learned) > max(0, int(max_learned)):
-            oldest = learned.pop(0)
-            oldest_path = os.path.join(self.gallery_dir, oldest)
-            try:
-                os.remove(oldest_path)
-                removed.append(oldest)
-                samples.pop(oldest, None)
-            except OSError:
+            anchor = self._quality_anchor(name)
+            worst = min(
+                learned,
+                key=lambda fn: (self._learned_quality(name, fn, anchor), fn))
+            archived_path = self._archive_learned_photo(worst)
+            if archived_path is None:
                 break
+            archived.append(archived_path)
+            learned.remove(worst)
+            samples.pop(worst, None)
+            if worst == filename:
+                candidate_active = False
+                path = archived_path
         self._refresh_gallery_mean(name)
         try:
             self._write_gallery_cache(name)
         except Exception:
             pass
-        return {"status": "learned", "path": path, "removed": removed,
+        return {"status": "learned" if candidate_active else "archived",
+                "path": path, "archived": archived,
                 "sample_count": len(samples)}
 
     def _embed(self, face_img, align_size=320):
@@ -708,7 +787,8 @@ class ReviewQueue:
     def confirm_many(self, record_ids, recognizer,
                      max_learned=30, duplicate_threshold=0.93):
         """批量确认是目标身份；成功或重复项移出队列，失败项保留。"""
-        result = {"learned": 0, "duplicate": 0, "invalid": 0, "error": 0}
+        result = {"learned": 0, "archived": 0, "retired": 0,
+                  "duplicate": 0, "invalid": 0, "error": 0}
         available = {item["id"]: item for item in self.list_items()}
         for record_id in dict.fromkeys(record_ids):
             item = available.get(record_id)
@@ -727,7 +807,14 @@ class ReviewQueue:
                 result["error"] += 1
                 continue
             status = learned.get("status", "error")
-            if status in ("learned", "duplicate"):
+            if status == "learned":
+                result["learned"] += 1
+                result["retired"] += len(learned.get("archived", []))
+                self.delete([record_id])
+            elif status == "archived":
+                result["archived"] += 1
+                self.delete([record_id])
+            elif status == "duplicate":
                 result[status] += 1
                 self.delete([record_id])
             elif status == "invalid":

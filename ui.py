@@ -460,8 +460,11 @@ class ReviewDialog(QDialog):
         result = self.queue.confirm_many(
             selected, self.recognizer, max_learned=self.max_learned,
             duplicate_threshold=self.duplicate_threshold)
-        message = (f"批量学习完成：新增 {result['learned']}，重复 {result['duplicate']}，"
-                   f"无法对齐 {result['invalid']}，失败 {result['error']}。")
+        message = (
+            f"批量学习完成：加入训练 {result['learned']}，"
+            f"质量不足归档 {result['archived']}，"
+            f"替换归档 {result['retired']}，重复 {result['duplicate']}，"
+            f"无法对齐 {result['invalid']}，失败 {result['error']}。")
         self.result_label.setText(message)
         self.message_ready.emit(f"[审核] {message}")
         self.refresh()
